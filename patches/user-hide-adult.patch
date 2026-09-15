@@ -992,7 +992,7 @@ index b51f1e0a..4199cb43 100644
                  priority: None,
                  soft_connections: None,
 diff --git a/backend/repository/src/user_repository.rs b/backend/repository/src/user_repository.rs
-index 349273b3..13b821a7 100644
+index bdd1e506..4e8fb4a1 100644
 --- a/backend/repository/src/user_repository.rs
 +++ b/backend/repository/src/user_repository.rs
 @@ -35,6 +35,7 @@ struct StoredProxyUserCredentials {
@@ -1019,7 +1019,7 @@ index 349273b3..13b821a7 100644
              comment: stored.comment.clone(),
              priority: stored.priority.unwrap_or(0),
              soft_connections: raw_soft_connections,
-@@ -541,6 +544,7 @@ mod tests {
+@@ -552,6 +555,7 @@ mod tests {
              status: Some(status),
              output_clusters: ClusterFlags::all(),
              ui_enabled: true,
@@ -1114,10 +1114,10 @@ index 17473b82..a0d92391 100644
          priority: 0,
          soft_connections,
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index 840cd742..dfaefe33 100644
+index 613c95b0..db05600d 100644
 --- a/frontend/public/assets/i18n/ar.json
 +++ b/frontend/public/assets/i18n/ar.json
-@@ -675,6 +675,7 @@
+@@ -676,6 +676,7 @@
        "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
        "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
        "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
@@ -1125,7 +1125,7 @@ index 840cd742..dfaefe33 100644
        "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
      },
      "USER_PLAN": {
-@@ -1648,6 +1649,7 @@
+@@ -1677,6 +1678,7 @@
      "USER_STATUS_TRIAL": "تجريبي",
      "USER_UI": "واجهة المستخدم",
      "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
@@ -1134,10 +1134,10 @@ index 840cd742..dfaefe33 100644
      "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
      "USE_OUTPUT": "استخدام المخرج",
 diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index 87bc0051..95502742 100644
+index 68d3ee7c..45b2b0eb 100644
 --- a/frontend/public/assets/i18n/en.json
 +++ b/frontend/public/assets/i18n/en.json
-@@ -679,6 +679,7 @@
+@@ -680,6 +680,7 @@
        "STATUS": "The active or disabled state of the user proxy credential.",
        "TOKEN": "Unique API token that can be used instead of username/password.",
        "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
@@ -1145,7 +1145,7 @@ index 87bc0051..95502742 100644
        "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
      },
      "USER_PLAN": {
-@@ -1735,6 +1736,7 @@
+@@ -1762,6 +1763,7 @@
      "USER_STATUS_TRIAL": "Trial",
      "USER_UI": "User UI",
      "USER_UI_ENABLED": "User-UI Enabled",
@@ -1154,10 +1154,10 @@ index 87bc0051..95502742 100644
      "USE_MEMORY_CACHE": "Mem-Cache",
      "USE_OUTPUT": "Use output",
 diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index 65955b91..1db19e0c 100644
+index ce646ba6..0e107663 100644
 --- a/frontend/public/assets/i18n/ru.json
 +++ b/frontend/public/assets/i18n/ru.json
-@@ -638,6 +638,7 @@
+@@ -639,6 +639,7 @@
        "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
        "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
        "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
@@ -1165,7 +1165,7 @@ index 65955b91..1db19e0c 100644
        "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
      },
      "USER_PLAN": {
-@@ -1545,6 +1546,7 @@
+@@ -1572,6 +1573,7 @@
      "USER_STATUS_TRIAL": "Пробный",
      "USER_UI": "Пользовательский UI",
      "USER_UI_ENABLED": "User-UI включен",
@@ -1265,7 +1265,7 @@ index 93ba95c1..4a49b94e 100644
 +    }
  }
 diff --git a/Cargo.lock b/Cargo.lock
-index 626b228b..0d590b75 100644
+index 44ce6f80..6d2fb274 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -4778,6 +4778,7 @@ dependencies = [
