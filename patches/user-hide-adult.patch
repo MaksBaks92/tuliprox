@@ -1265,10 +1265,10 @@ index 93ba95c1..4a49b94e 100644
 +    }
  }
 diff --git a/Cargo.lock b/Cargo.lock
-index 44ce6f80..6d2fb274 100644
+index 39e3a91e..1c5c302b 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -4778,6 +4778,7 @@ dependencies = [
+@@ -4785,6 +4785,7 @@ dependencies = [
   "bytes",
   "chrono",
   "crc32fast",
