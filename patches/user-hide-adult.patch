@@ -1,8 +1,8 @@
 diff --git a/backend/app/src/api/api_utils/mod.rs b/backend/app/src/api/api_utils/mod.rs
-index 5ba652a9..155baa0f 100644
+index 94fb7efd..3f2cfefb 100644
 --- a/backend/app/src/api/api_utils/mod.rs
 +++ b/backend/app/src/api/api_utils/mod.rs
-@@ -4147,6 +4147,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+@@ -4365,6 +4365,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: false,
@@ -11,10 +11,10 @@ index 5ba652a9..155baa0f 100644
          priority: 0,
          soft_connections: 0,
 diff --git a/backend/app/src/api/api_utils/tests.rs b/backend/app/src/api/api_utils/tests.rs
-index e66877c5..bf15f52f 100644
+index ae0738b5..fc45f0c0 100644
 --- a/backend/app/src/api/api_utils/tests.rs
 +++ b/backend/app/src/api/api_utils/tests.rs
-@@ -5485,6 +5485,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
+@@ -8537,6 +8537,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
          status: None,
          output_clusters: ClusterFlags::all(),
          ui_enabled: true,
@@ -37,10 +37,10 @@ index 5a635221..4af6d296 100644
                          })
                          .count()
 diff --git a/backend/app/src/api/endpoints/m3u_api.rs b/backend/app/src/api/endpoints/m3u_api.rs
-index 0aa5df6a..d1da38cc 100644
+index 2a4961a0..0f28f512 100644
 --- a/backend/app/src/api/endpoints/m3u_api.rs
 +++ b/backend/app/src/api/endpoints/m3u_api.rs
-@@ -608,8 +608,8 @@ fn resolve_loaded_m3u_catchup(
+@@ -614,8 +614,8 @@ fn resolve_loaded_m3u_catchup(
      Ok((catchup_item, resolved.discriminator))
  }
  
@@ -51,7 +51,7 @@ index 0aa5df6a..d1da38cc 100644
  }
  
  #[allow(clippy::too_many_lines)]
-@@ -846,7 +846,7 @@ async fn m3u_api_catchup(
+@@ -852,7 +852,7 @@ async fn m3u_api_catchup(
              return axum::http::StatusCode::BAD_REQUEST.into_response();
          }
      };
@@ -60,7 +60,7 @@ index 0aa5df6a..d1da38cc 100644
          return axum::http::StatusCode::FORBIDDEN.into_response();
      }
  
-@@ -1134,10 +1134,74 @@ mod tests {
+@@ -1140,10 +1140,74 @@ mod tests {
  
      #[test]
      fn resolved_catchup_item_requires_rechecked_permissions() {
@@ -331,7 +331,7 @@ index 69de69cd..ff27d060 100644
      async fn xmltv_output_uses_canonical_channel_ids_and_only_lowercases_display_names() {
          let dir = tempdir().expect("temp dir");
 diff --git a/backend/app/src/api/endpoints/xtream_api/mod.rs b/backend/app/src/api/endpoints/xtream_api/mod.rs
-index 6ccaedf5..2d697e49 100644
+index b5a50b96..447d0580 100644
 --- a/backend/app/src/api/endpoints/xtream_api/mod.rs
 +++ b/backend/app/src/api/endpoints/xtream_api/mod.rs
 @@ -321,7 +321,8 @@ async fn xtream_player_api_stream(
@@ -344,7 +344,7 @@ index 6ccaedf5..2d697e49 100644
      if !output_allowed {
          if is_hls_manifest_request {
              return hls_custom_video_manifest_response(
-@@ -1063,6 +1064,7 @@ async fn xtream_player_api_resource(
+@@ -1069,6 +1070,7 @@ async fn xtream_player_api_resource(
  
      if !user.allows_item_type(pli.item_type)
          || !(user.t_filter.is_none() || user.allows_content(&shared::model::PlaylistItem::from(&pli)))
@@ -352,7 +352,7 @@ index 6ccaedf5..2d697e49 100644
      {
          return axum::http::StatusCode::NOT_FOUND.into_response();
      }
-@@ -1523,6 +1525,9 @@ async fn xtream_player_api_handle_content_action(
+@@ -1529,6 +1531,9 @@ async fn xtream_player_api_handle_content_action(
                          {
                              categories.retain(|c| c.category_id.parse::<u32>().is_ok_and(|id| visible.contains(&id)));
                          }
@@ -1102,7 +1102,7 @@ index 8bacf477..f6823b36 100644
  
      #[tokio::test]
 diff --git a/backend/session/src/active_user_manager/tests.rs b/backend/session/src/active_user_manager/tests.rs
-index 17473b82..a0d92391 100644
+index 90853240..dc2a17db 100644
 --- a/backend/session/src/active_user_manager/tests.rs
 +++ b/backend/session/src/active_user_manager/tests.rs
 @@ -1228,6 +1228,7 @@ fn test_user_credentials(username: &str, max_connections: u32, soft_connections:
@@ -1265,10 +1265,10 @@ index 93ba95c1..4a49b94e 100644
 +    }
  }
 diff --git a/Cargo.lock b/Cargo.lock
-index 39e3a91e..1c5c302b 100644
+index fbc3be36..af598ced 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -4785,6 +4785,7 @@ dependencies = [
+@@ -4848,6 +4848,7 @@ dependencies = [
   "bytes",
   "chrono",
   "crc32fast",
