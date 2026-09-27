@@ -34,9 +34,13 @@ use crate::{
     },
     repository::load_input_m3u_stream_url,
     utils::{
-        async_file_reader, async_file_writer, create_new_file_for_write, debug_if_enabled, get_file_extension, request,
-        request::{content_type_from_ext, parse_range, send_with_retry_and_provider},
-        trace_if_enabled,
+        async_file_reader, async_file_writer, classify_output_resource_url, classify_resource_hop,
+        create_new_file_for_write, debug_if_enabled, get_file_extension, request,
+        request::{
+            classify_resource_destination, content_type_from_ext, parse_range, send_with_retry_and_provider,
+            ResourceDestination,
+        },
+        trace_if_enabled, ResourceHop,
     },
     BUILD_TIMESTAMP,
 };
@@ -56,7 +60,8 @@ use shared::{
     defaults::{DASH_EXT, HLS_EXT},
     model::{
         ConfigTargetOptions, InputFetchMethod, InputType, PlaylistEntry, PlaylistItemType, ProxyType,
-        StalkerStreamKind, StreamChannel, StreamInfo, TargetType, UserConnectionPermission, VirtualId, XtreamCluster,
+        ResourceOutputPolicy, StalkerStreamKind, StreamChannel, StreamInfo, TargetType, UserConnectionPermission,
+        VirtualId, XtreamCluster,
     },
     utils::{
         bin_serialize, current_time_secs, extract_extension_from_url, get_credentials_from_url, human_readable_kbps,
@@ -488,6 +493,7 @@ struct SessionActivationRequest<'a> {
     stream_url: &'a str,
     connection_permission: UserConnectionPermission,
     connection_kind: crate::api::model::ConnectionKind,
+    granted_grace_mode: Option<crate::api::model::GraceMode>,
     socket_bound: bool,
 }
 
@@ -515,6 +521,7 @@ async fn activate_session_before_stream_open(
         stream_url,
         connection_permission,
         connection_kind,
+        granted_grace_mode,
         socket_bound,
     } = request;
     // Classify based on current session state, not the pre-computed value.
@@ -556,11 +563,26 @@ async fn activate_session_before_stream_open(
     // would evict the same session again). But we must still materialize the grace
     // lifecycle (PendingProvider / GraceActive) so the session state is consistent.
     if connection_permission == UserConnectionPermission::GracePeriod {
+        if loaded_session.as_ref().is_none_or(Option::is_none) {
+            app_state
+                .active_users
+                .ensure_user_session_placeholder(crate::api::model::CreateUserSessionParams {
+                    user,
+                    session_token,
+                    virtual_id: virtual_id.get(),
+                    provider: input.name.as_ref(),
+                    stream_url,
+                    addr: &fingerprint.addr,
+                    connection_permission,
+                    connection_kind: Some(connection_kind),
+                    socket_bound,
+                })
+                .await;
+        }
         // Materialize grace lifecycle under the guard so the session state is consistent.
-        // Determine which grace mode applies by checking the current session state.
         let current_session = match loaded_session {
-            Some(session) => session,
-            None => app_state.active_users.get_and_update_user_session(&user.username, session_token).await,
+            Some(Some(session)) => Some(session),
+            _ => app_state.active_users.get_and_update_user_session(&user.username, session_token).await,
         };
         let (_, resolved_grace) = match current_session.as_ref().map(|s| &s.lifecycle) {
             Some(crate::api::model::PlaybackLifecycle::PendingProvider { .. }) => {
@@ -590,18 +612,14 @@ async fn activate_session_before_stream_open(
                 )
             }
             Some(crate::api::model::PlaybackLifecycle::GraceActive) => {
-                // Already in GraceActive — infer mode from item_type.
-                let mode = if item_type.is_live() || item_type.is_live_adaptive() {
-                    crate::api::model::GraceMode::Hold
-                } else {
-                    crate::api::model::GraceMode::Instant
-                };
-                (crate::api::model::PlaybackLifecycle::GraceActive, Some(mode))
+                (crate::api::model::PlaybackLifecycle::GraceActive, Some(crate::api::model::GraceMode::Instant))
             }
             _ => {
-                // Session not yet in grace state — infer from item_type defaults.
-                // Live/LiveHls/LiveDash default to Hold; VOD/Catchup to Instant.
-                if item_type.is_live() || item_type.is_live_adaptive() {
+                let hold_stream = granted_grace_mode.map_or_else(
+                    || item_type.is_live() || item_type.is_live_adaptive(),
+                    |mode| matches!(mode, crate::api::model::GraceMode::Hold),
+                );
+                if hold_stream {
                     let deadline = current_time_secs().saturating_add(app_state.get_grace_options().timeout_secs);
                     let _ = app_state
                         .active_users
@@ -1286,8 +1304,6 @@ async fn resolve_streaming_strategy(
     input: &ConfigInput,
     options: StreamingAcquireOptions<'_>,
 ) -> StreamingStrategy {
-    // allocate a provider connection
-    let accept_requested_stream_url = options.accept_requested_stream_url || input.input_type.is_stalker();
     let mut provider_connection_handle = acquire_stream_provider_handle(app_state, input, fingerprint, &options).await;
 
     // panel_api provisioning/loading is handled later in the stream creation flow
@@ -1303,6 +1319,12 @@ async fn resolve_streaming_strategy(
                 ProviderStreamState::Custom { response: stream, reason: ProviderStreamCustomReason::ProviderExhausted }
             }
             ProviderAllocation::Available(ref provider_cfg) | ProviderAllocation::GracePeriod(ref provider_cfg) => {
+                // If a forced/pinned provider was requested but allocation fell back to another account,
+                // the session's stream_url still points to the old provider and cannot be accepted as-is;
+                // it must be resolved or rewritten for the newly allocated provider account.
+                let accept_requested_stream_url = (options.accept_requested_stream_url
+                    || input.input_type.is_stalker())
+                    && options.force_provider.is_none_or(|forced| forced.as_ref() == provider_cfg.name.as_ref());
                 // Keep the URL only when it already targets the selected provider account. Hot reload can leave old
                 // alias URLs in persisted playlists until the next processing run.
                 if let Some((selected_provider_name, url)) = select_provider_stream_url(
@@ -1621,6 +1643,9 @@ async fn create_stream_response_details(
             } else {
                 false
             };
+            let is_fallback_provider = force_provider
+                .is_some_and(|forced| guard_provider_name.as_ref().is_some_and(|allocated| allocated != forced));
+            let session_headers = if is_fallback_provider { None } else { session_headers };
             let (stream, stream_info, provider_session_headers, reconnect_flag) =
                 if defer_provider_stream_until_grace_check {
                     debug_if_enabled!(
@@ -1781,6 +1806,13 @@ async fn create_stream_response_details(
                     }
                     (stream, stream_info, provider_session_headers, reconnect_flag)
                 };
+
+            if is_fallback_provider && stream.is_some() {
+                if let Some(token) = session_owner {
+                    let _ =
+                        app_state.active_users.update_session_provider_headers(username, token, &HashMap::new()).await;
+                }
+            }
 
             if log_enabled!(log::Level::Debug) {
                 if let Some((headers, status_code, response_url, _custom_video_type)) = stream_info.as_ref() {
@@ -2123,10 +2155,14 @@ pub async fn force_provider_stream_response(
         cleanup_forced_reopen_addrs(app_state, &user_session.token, &cleanup_addrs).await;
     }
 
-    // Provider-affine playback must stay on the same provider account across seeks/range reconnects.
-    // Only non-affine sessions may fall back to a different account in the same lineup.
-    let preferred_provider = Some(&user_session.provider);
-    let allow_forced_provider_fallback = !item_type.requires_provider_affinity();
+    // A provider stays preferred after real media flows or while its allocation is active.
+    // A start that produced no media may choose another alias on its next request.
+    // An exhausted preferred account can still fall back to the lineup.
+    let preferred_provider = (item_type.is_live()
+        || user_session.media_started.load(std::sync::atomic::Ordering::Acquire)
+        || app_state.active_provider.should_reuse_playback_provider(&user_session.token, &user_session.provider))
+    .then_some(&user_session.provider);
+    let allow_forced_provider_fallback = true;
     // Never allow provider-side grace for forced seek/session reacquire.
     // Over-allocation here would break provider-side one-connection limits.
     let allow_provider_grace = false;
@@ -2153,8 +2189,8 @@ pub async fn force_provider_stream_response(
         connection_kind,
         true,
         Some(user_session.token.as_str()),
-        Some(&user_session.provider_session_headers),
-        true,
+        preferred_provider.map(|_| &user_session.provider_session_headers),
+        preferred_provider.is_some(),
         grace_mode.map(|mode| matches!(mode, crate::api::model::GraceMode::Hold)),
         None,
     )
@@ -2191,6 +2227,38 @@ pub async fn force_provider_stream_response(
                     PlaybackKind::classify(item_type, extract_extension_from_url(user_session.stream_url.as_ref())),
                     ctx.session_reservation_ttl_secs,
                 );
+            }
+        }
+        if let Some(allocated_provider) = stream_details.provider_name.as_ref() {
+            if allocated_provider.as_ref() != user_session.provider.as_ref() {
+                let new_stream_url =
+                    stream_details.request_url.as_deref().map_or_else(|| user_session.stream_url.clone(), Arc::from);
+                app_state
+                    .active_users
+                    .update_session_provider_binding(
+                        &ctx.user.username,
+                        &user_session.token,
+                        Arc::clone(allocated_provider),
+                        new_stream_url,
+                    )
+                    .await;
+                app_state
+                    .active_users
+                    .update_session_provider_headers(
+                        &ctx.user.username,
+                        &user_session.token,
+                        &stream_details.provider_session_headers,
+                    )
+                    .await;
+            } else if !stream_details.provider_session_headers.is_empty() {
+                app_state
+                    .active_users
+                    .update_session_provider_headers(
+                        &ctx.user.username,
+                        &user_session.token,
+                        &stream_details.provider_session_headers,
+                    )
+                    .await;
             }
         }
         app_state.active_users.update_session_addr(&ctx.user.username, &user_session.token, &fingerprint.addr).await;
@@ -2307,6 +2375,7 @@ pub(crate) async fn stream_response(
             stream_url,
             connection_permission,
             connection_kind,
+            granted_grace_mode: grace_mode,
             socket_bound,
         },
     )
@@ -2399,6 +2468,13 @@ pub(crate) async fn stream_response(
 
     let stream_options = get_stream_options(&app_state.app_config);
     let session_state = app_state.active_users.get_and_update_user_session(&user.username, session_token).await;
+    let pinned_provider = pinned_provider.filter(|provider| {
+        item_type.is_live()
+            || session_state
+                .as_ref()
+                .is_some_and(|session| session.media_started.load(std::sync::atomic::Ordering::Acquire))
+            || app_state.active_provider.should_reuse_playback_provider(session_token, provider)
+    });
     let mut stream_details = match create_stream_response_details(
         app_state,
         &stream_options,
@@ -2595,6 +2671,35 @@ pub(crate) async fn stream_response(
             stream_details.shared_subscriber_id =
                 pending_shared_cleanup.as_ref().map(tuliprox_session::PendingSharedSubscriberCleanup::capability);
         }
+        // In the no-limits path there may be no placeholder yet. The body needs the
+        // session's media flag before its first byte; create that session now.
+        let created_media_session = if !is_stream_shared
+            && !item_type.is_live()
+            && item_type.requires_provider_affinity()
+            && app_state.active_users.media_started_flag(&user.username, session_token).await.is_none()
+        {
+            if let Some(provider) = provider_name.as_deref() {
+                app_state
+                    .active_users
+                    .ensure_user_session_placeholder(crate::api::model::CreateUserSessionParams {
+                        user,
+                        session_token,
+                        virtual_id,
+                        provider,
+                        stream_url: actual_request_url.as_ref(),
+                        addr: &fingerprint.addr,
+                        connection_permission,
+                        connection_kind: Some(connection_kind),
+                        socket_bound,
+                    })
+                    .await;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let stream = match create_active_client_stream(crate::api::model::ActiveClientStreamParams {
             stream_details,
             app_state,
@@ -2613,15 +2718,19 @@ pub(crate) async fn stream_response(
         {
             Ok(stream) => stream,
             Err(error) => {
-                app_state
-                    .active_users
-                    .release_unbound_session_reservation(
-                        &user.username,
-                        session_token,
-                        activation.placeholder_transition_version,
-                        activation.placeholder_transition_version.is_some(),
-                    )
-                    .await;
+                if created_media_session {
+                    app_state.active_users.terminate_session(&user.username, session_token).await;
+                } else {
+                    app_state
+                        .active_users
+                        .release_unbound_session_reservation(
+                            &user.username,
+                            session_token,
+                            activation.placeholder_transition_version,
+                            activation.placeholder_transition_version.is_some(),
+                        )
+                        .await;
+                }
                 return stream_admission_rejected_response(error, &user.username);
             }
         };
@@ -3414,6 +3523,7 @@ pub(crate) async fn local_stream_response(
                 stream_url: &pli.url,
                 connection_permission,
                 connection_kind,
+                granted_grace_mode: None,
                 socket_bound,
             },
         )
@@ -3597,6 +3707,7 @@ fn windows_file_identity(file: &tokio::fs::File) -> std::io::Result<(u32, u32, u
 async fn build_resource_stream_response(
     app_state: &Arc<AppState>,
     cache_key: Option<&str>,
+    fetch_policy: ResourceFetchPolicy,
     resource_url: &str,
     response: reqwest::Response,
 ) -> axum::response::Response {
@@ -3606,7 +3717,20 @@ async fn build_resource_stream_response(
     let mime_type = get_mime_type(response.headers(), resource_url);
     let has_content_range = response.headers().contains_key(header::CONTENT_RANGE);
     for (key, value) in response.headers() {
-        if !is_hop_by_hop_response_header(key) {
+        if !is_hop_by_hop_response_header(key)
+            && (fetch_policy == ResourceFetchPolicy::Public
+                || matches!(
+                    *key,
+                    header::CONTENT_TYPE
+                        | header::CONTENT_LENGTH
+                        | header::CONTENT_ENCODING
+                        | header::CONTENT_RANGE
+                        | header::ACCEPT_RANGES
+                        | header::ETAG
+                        | header::LAST_MODIFIED
+                        | header::CACHE_CONTROL
+                ))
+        {
             response_builder = response_builder.header(key, value);
         }
     }
@@ -3653,92 +3777,240 @@ async fn build_resource_stream_response(
     try_unwrap_body!(response_builder.body(axum::body::Body::from_stream(byte_stream)))
 }
 
+/// Upper bound of redirect hops a resource route follows. Every hop is classified, so the number of
+/// requests a provider or EPG entry can trigger through one resource link stays bounded.
+const RESOURCE_REDIRECT_LIMIT: u8 = 5;
+
+/// Whether outbound requests of this configuration may leave through a proxy, including one provided by
+/// the environment, because the public resource client honours both.
+fn proxy_in_use(app_state: &Arc<AppState>) -> bool {
+    app_state.app_config.config.load().proxy.is_some() || crate::model::proxy_env_present()
+}
+
 async fn fetch_resource_with_retry(
     app_state: &Arc<AppState>,
-    http_client: &reqwest::Client,
     url: &Url,
-    cache_key: Option<&str>,
+    fetch_policy: ResourceFetchPolicy,
     resource_url: &str,
     req_headers: &HashMap<String, Vec<u8>>,
     input: Option<&ConfigInput>,
 ) -> Option<axum::response::Response> {
+    let cache_key = fetch_policy.cache_key(resource_url);
     let config = app_state.app_config.config.load();
     let default_user_agent = config.default_user_agent.clone();
     drop(config);
 
     let disabled_headers = app_state.get_disabled_headers();
+    let mut current_url = url.clone();
+    let mut current_headers = req_headers.clone();
+    let mut current_input = input;
+    let mut method = input.map_or(InputFetchMethod::GET, |i| i.method);
 
-    let provider_config = input.and_then(|i| i.get_resolve_provider(url.as_str()));
-    let Ok(response) =
-        send_with_retry_and_provider(&app_state.app_config, url, provider_config.as_ref(), false, |resolved_url| {
-            request::get_client_request(
-                http_client,
-                input.map_or(InputFetchMethod::GET, |i| i.method),
-                input.map(|i| &i.headers),
-                resolved_url,
-                Some(req_headers),
-                disabled_headers.as_ref(),
-                default_user_agent.as_deref(),
-            )
-        })
-        .await
-    else {
-        return None;
-    };
-
-    let status = response.status();
-
-    if status.is_success() {
-        return Some(build_resource_stream_response(app_state, cache_key, resource_url, response).await);
-    }
-
-    // Non-retriable Status -> Upstream Response incl. Body
-    debug_if_enabled!("Failed to open resource got status {status} for {}", sanitize_sensitive_info(resource_url));
-
-    let mut response_builder = axum::response::Response::builder().status(status);
-    for (key, value) in response.headers() {
-        if !is_hop_by_hop_response_header(key) {
-            response_builder = response_builder.header(key, value);
+    for redirects in 0..=RESOURCE_REDIRECT_LIMIT {
+        // Every hop is routed on its own, so a redirect cannot move a request to an egress the hop
+        // itself would not have used.
+        let hop = classify_resource_hop(current_url.as_str(), proxy_in_use(app_state)).await;
+        if hop == ResourceHop::Blocked {
+            debug!("Refused resource destination local to this host: {}", sanitize_sensitive_info(resource_url));
+            return None;
         }
+        let use_proxy_aware_client = hop == ResourceHop::ViaProxy;
+        let provider_config = current_input.and_then(|i| i.get_resolve_provider(current_url.as_str()));
+        let response = match send_with_retry_and_provider(
+            &app_state.app_config,
+            &current_url,
+            provider_config.as_ref(),
+            // Hand redirects back instead of retrying them: the loop below follows them itself, so that
+            // every hop is classified and no client-side redirect policy decides where the request ends.
+            true,
+            |resolved_url| {
+                let http_client = if use_proxy_aware_client {
+                    app_state.resource_public_http_client_no_redirect.load()
+                } else {
+                    app_state.resource_http_client_no_redirect.load()
+                };
+                request::get_client_request(
+                    &http_client,
+                    method,
+                    current_input.map(|i| &i.headers),
+                    resolved_url,
+                    Some(&current_headers),
+                    disabled_headers.as_ref(),
+                    default_user_agent.as_deref(),
+                )
+            },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                debug!(
+                    "Resource fetch failed for {}: {}",
+                    sanitize_sensitive_info(resource_url),
+                    sanitize_sensitive_info(&err.to_string())
+                );
+                return None;
+            }
+        };
+
+        let status = response.status();
+        if status.is_redirection() {
+            if redirects == RESOURCE_REDIRECT_LIMIT {
+                debug!("Resource redirect limit reached for {}", sanitize_sensitive_info(resource_url));
+                return None;
+            }
+            let next_url = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| response.url().join(location).ok());
+            let Some(next_url) = next_url else {
+                debug!("Resource redirect has no usable location for {}", sanitize_sensitive_info(resource_url));
+                return None;
+            };
+            let same_origin = response.url().scheme() == next_url.scheme()
+                && response.url().host_str() == next_url.host_str()
+                && response.url().port_or_known_default() == next_url.port_or_known_default();
+            if !same_origin {
+                current_headers.retain(|key, _| request::is_safe_cross_origin_redirect_header(key));
+                current_input = None;
+            }
+            if !matches!(status, StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT) {
+                method = InputFetchMethod::GET;
+            }
+            current_url = next_url;
+            continue;
+        }
+
+        if status.is_success() {
+            return Some(
+                build_resource_stream_response(app_state, cache_key, fetch_policy, resource_url, response).await,
+            );
+        }
+
+        debug_if_enabled!("Failed to open resource got status {status} for {}", sanitize_sensitive_info(resource_url));
+        if !fetch_policy.relays_upstream_response() {
+            return Some(status.into_response());
+        }
+        let mut response_builder = axum::response::Response::builder().status(status);
+        for (key, value) in response.headers() {
+            if !is_hop_by_hop_response_header(key) {
+                response_builder = response_builder.header(key, value);
+            }
+        }
+        let stream = response.bytes_stream().map_err(|err| StreamError::reqwest(&err));
+        return Some(try_unwrap_body!(response_builder.body(axum::body::Body::from_stream(stream))));
     }
-
-    let stream = response.bytes_stream().map_err(|err| StreamError::reqwest(&err));
-
-    Some(try_unwrap_body!(response_builder.body(axum::body::Body::from_stream(stream))))
+    None
 }
 
+/// How the client-visible answer of a resource route is shaped.
+///
+/// The variant mirrors the classification of the destination the route serves: a [`Public`] destination
+/// may be handed to the client as it was fetched, a [`NonPublic`] one is relayed with a sanitized
+/// answer. Which client performs a hop is decided per hop, not by this policy.
+///
+/// [`Public`]: ResourceFetchPolicy::Public
+/// [`NonPublic`]: ResourceFetchPolicy::NonPublic
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceFetchPolicy {
-    Standard,
-    PublicNoRedirect,
+    Public,
+    NonPublic,
+}
+
+pub fn resource_input_for_url<'a>(input: Option<&'a ConfigInput>, resource_url: &str) -> Option<&'a ConfigInput> {
+    let input = input?;
+    let source = Url::parse(&input.url).ok()?;
+    let resource = Url::parse(resource_url).ok()?;
+    (source.scheme() == resource.scheme()
+        && source.host_str() == resource.host_str()
+        && source.port_or_known_default() == resource.port_or_known_default())
+    .then_some(input)
+}
+
+pub async fn resource_redirect_or_proxy(
+    app_state: &Arc<AppState>,
+    resource_url: &str,
+    req_headers: &HeaderMap,
+    input: Option<&ConfigInput>,
+) -> axum::response::Response {
+    let Some(resource_url) = shared::model::persisted_resource_url(resource_url) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let resource_url = resource_url.as_ref();
+    if resource_url.starts_with("/api/v1/library/thumbnail/") {
+        return redirect(resource_url).into_response();
+    }
+    if resource_url.starts_with("media-server://image/") {
+        return resource_response(app_state, ResourceFetchPolicy::NonPublic, resource_url, req_headers, None)
+            .await
+            .into_response();
+    }
+    let Ok(url) = Url::parse(resource_url) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(host) = url.host_str() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if classify_resource_destination(host).await == ResourceDestination::Public {
+        redirect(resource_url).into_response()
+    } else {
+        resource_proxy_response(app_state, resource_url, req_headers, resource_input_for_url(input, resource_url)).await
+    }
+}
+
+pub async fn resource_proxy_response(
+    app_state: &Arc<AppState>,
+    resource_url: &str,
+    req_headers: &HeaderMap,
+    input: Option<&ConfigInput>,
+) -> axum::response::Response {
+    let Some(resource_url) = shared::model::persisted_resource_url(resource_url) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let resource_url = resource_url.as_ref();
+    let input = resource_input_for_url(input, resource_url);
+    match classify_output_resource_url(resource_url).await {
+        ResourceOutputPolicy::Direct if resource_url.starts_with("/api/v1/library/thumbnail/") => {
+            redirect(resource_url).into_response()
+        }
+        ResourceOutputPolicy::Direct => {
+            resource_response(app_state, ResourceFetchPolicy::Public, resource_url, req_headers, input)
+                .await
+                .into_response()
+        }
+        ResourceOutputPolicy::Proxy => {
+            resource_response(app_state, ResourceFetchPolicy::NonPublic, resource_url, req_headers, input)
+                .await
+                .into_response()
+        }
+        ResourceOutputPolicy::Blocked => StatusCode::FORBIDDEN.into_response(),
+    }
 }
 
 impl ResourceFetchPolicy {
     const fn cache_key(self, resource_url: &str) -> Option<&str> {
         match self {
-            Self::Standard => Some(resource_url),
-            Self::PublicNoRedirect => None,
+            Self::Public => Some(resource_url),
+            Self::NonPublic => None,
         }
     }
 
-    const fn requires_public_destination(self) -> bool { matches!(self, Self::PublicNoRedirect) }
+    /// Whether an upstream response may be relayed to the client.
+    ///
+    /// A public destination was chosen by the user's own configuration, so what it answered is what
+    /// the client asked for. A resource proxy whose destination is deliberately hidden from the client
+    /// must not become a reader for that destination: status, headers and body of an upstream error can
+    /// disclose more about the internal service than the link itself.
+    const fn relays_upstream_response(self) -> bool { matches!(self, Self::Public) }
 }
 
-async fn validate_public_resource_destination(url: &Url) -> std::io::Result<()> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsupported resource URL scheme"));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "resource URL has no host"))?;
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "resource URL has no port"))?;
-    tuliprox_core::utils::network::request::resolve_public_socket_addrs(host, port).await?;
-    Ok(())
-}
-
-/// # Panics
+/// Callers must pass an already-decoded resource URL (not a `resource://v1/` locator).
+/// [`resource_redirect_or_proxy`] and [`resource_proxy_response`] handle the decode before
+/// dispatching here; XMLTV and Web-UI endpoints pass URLs from authenticated tokens.
 pub async fn resource_response(
     app_state: &Arc<AppState>,
     fetch_policy: ResourceFetchPolicy,
@@ -3749,20 +4021,6 @@ pub async fn resource_response(
     if resource_url.is_empty() {
         return StatusCode::NO_CONTENT.into_response();
     }
-
-    let validated_url = if fetch_policy.requires_public_destination() {
-        let Ok(url) = Url::parse(resource_url) else {
-            error!("Url is malformed {}", sanitize_sensitive_info(resource_url));
-            return StatusCode::BAD_REQUEST.into_response();
-        };
-        if let Err(err) = validate_public_resource_destination(&url).await {
-            debug!("Rejected non-public resource destination {}: {err}", sanitize_sensitive_info(resource_url));
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-        Some(url)
-    } else {
-        None
-    };
 
     if resource_url.starts_with("media-server://image/") {
         return match open_media_server_image_resource(app_state, resource_url).await {
@@ -3778,7 +4036,7 @@ pub async fn resource_response(
             }
         };
     }
-    let filter: HeaderFilter = Some(Box::new(|key| key != "if-none-match" && key != "if-modified-since"));
+    let filter: HeaderFilter = Some(Box::new(request::is_safe_cross_origin_redirect_header));
     let req_headers = get_headers_from_request(req_headers, &filter);
     let cache_key = fetch_policy.cache_key(resource_url);
     if let (Some(cache_key), Some(cache)) = (cache_key, app_state.cache.load().as_ref()) {
@@ -3799,13 +4057,20 @@ pub async fn resource_response(
         }
     }
     trace_if_enabled!("Try to fetch resource {}", sanitize_sensitive_info(resource_url));
-    if let Ok(url) = validated_url.map_or_else(|| Url::parse(resource_url), Ok) {
-        let http_client = match fetch_policy {
-            ResourceFetchPolicy::Standard => app_state.http_client.load(),
-            ResourceFetchPolicy::PublicNoRedirect => app_state.public_http_client_no_redirect.load(),
+    if let Ok(url) = Url::parse(resource_url) {
+        // A resource URL is chosen by playlist or EPG content, so the destination is never fetched
+        // blindly: an address local to this host (loopback, link-local, cloud metadata) would turn
+        // the proxy into a reader for the proxy host itself. Private network destinations stay
+        // allowed, because self-hosted services are the reason this route exists.
+        let Some(host) = url.host_str() else {
+            return StatusCode::BAD_REQUEST.into_response();
         };
+        if classify_resource_destination(host).await == ResourceDestination::Blocked {
+            debug!("Refused resource destination local to this host: {}", sanitize_sensitive_info(resource_url));
+            return StatusCode::FORBIDDEN.into_response();
+        }
         if let Some(resp) =
-            fetch_resource_with_retry(app_state, &http_client, &url, cache_key, resource_url, &req_headers, input).await
+            fetch_resource_with_retry(app_state, &url, fetch_policy, resource_url, &req_headers, input).await
         {
             return resp;
         }

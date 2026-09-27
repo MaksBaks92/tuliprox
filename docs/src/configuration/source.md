@@ -159,9 +159,6 @@ inputs:
       device:
         mac_address: '00:1A:79:12:34:56'
     enabled: true
-    options:
-      stalker_pre_resolve_playback: false
-      stalker_runtime_resolve_playback: true
 ```
 
 Stalker refreshes write pages into an unpublished generation. Live, VOD, series, and EPG selected for one refresh
@@ -171,9 +168,9 @@ previous complete snapshot; a first import exposes no partial catalog. A saved c
 When `process_parallel` is enabled, progress messages include the input name. Targets wait for every enabled input in
 their source and begin as soon as that source is ready, without waiting for unrelated sources.
 
-Use `stalker_pre_resolve_playback: true` if you want Tuliprox to materialize playback URLs during refresh whenever the portal already grants them.
-Keep `stalker_runtime_resolve_playback: true` when the portal uses expiring or session-bound temp links that may need a fresh `create_link`
-call later during playback.
+Stalker playback is resolved on demand: the catalog is imported without materializing stream URLs, and a playback
+request runs `create_link` against the portal when the item has no usable URL yet. A stale portal session is
+re-handshaken once and the request is retried.
 
 Stalker supports four authentication modes:
 
@@ -260,8 +257,6 @@ specific provider.
 | `resolve_delay` / `probe_delay`            | Int      | `2`     | **Ban Protection:** Hard wait time (in seconds) between API or Probe requests to the *same* provider! Prevents API spamming.                                                                                                           |
 | `resolve_filter`                           | String   | -       | Filter expression to selectively resolve only entries matching the condition. Uses the same Filter syntax.                                                                                                                             |
 | `probe_filter`                             | String   | -       | Filter expression to selectively probe only entries matching the condition. Uses the same Filter syntax.                                                                                                                               |
-| `stalker_pre_resolve_playback`             | Bool     | `false` | Stalker-only: resolves `create_link` during playlist processing and persists the returned playback URL when the portal already grants one. Useful when you want the playlist/export step to materialize playable stream URLs up front. |
-| `stalker_runtime_resolve_playback`         | Bool     | `false` | Stalker-only: lets the reverse-proxy retry `create_link` during playback when a persisted Stalker URL has gone stale or is rejected by the portal. This is the recovery path for temp links and expired session-bound stream URLs.     |
 
 > **Note:** For `resolve_vod` and `resolve_series`, data is cached per input and only new or changed entries are
 > updated.
@@ -335,18 +330,18 @@ again when the process restarts. Shared playback uses the identity of the shared
 #### Stalker playback notes
 
 * Stalker playlist preview in the Web UI now works through the same protected playlist endpoints used for other input types.
-* `stalker_pre_resolve_playback` and `stalker_runtime_resolve_playback` are complementary:
-  * `stalker_pre_resolve_playback: true` tries to turn portal `cmd` values into concrete playback URLs during refresh.
-  * `stalker_runtime_resolve_playback: true` retries `create_link` later if the stored playback URL is stale, temp-link based, or rejected after processing.
+* Stalker items are imported with their portal metadata and playback descriptor but without a materialized stream URL, so the
+  exported playlist never exposes the raw portal `cmd`.
+* Playback resolves the item on demand: the reverse-proxy path runs `create_link` for the item's descriptor candidates and
+  falls back to the item's stored `cmd` when no descriptor candidate is usable.
 * Temp-link variants (`nginx_secure_link`, `flussonic_tmp_link`, `wowza_tmp_link`) are persisted as explicit playback modes
   and reused during runtime refresh, instead of being flattened into a generic direct-URL path.
-* When pre-resolve does not materialize a URL, Tuliprox keeps the Stalker item metadata and playback descriptor but does
-  not leak the raw `cmd` into the exported playlist URL field.
-* If pre-resolve is disabled or the portal refuses to resolve a specific item during refresh, the item can still remain playable
-  later through runtime resolution, assuming the reverse-proxy path is used and runtime resolve is enabled.
 * Runtime refresh reuses a cached Stalker client per input configuration and treats the session TTL as a soft re-handshake boundary.
-  If refresh still cannot resolve a playable URL, Tuliprox invalidates the stale persisted URL instead of continuing to serve it indefinitely.
-* Stalker EPG import now also consumes the portal bulk-EPG endpoint during processing when Stalker playback pre-resolve is enabled.
+  A portal that rejects the session (HTTP 401/403/204/456, or a `code` 44 / 440..449 body) triggers one re-handshake and retry;
+  a portal that refuses the request again is reported with the portal's reason in the log.
+* A playback request only ever reads the published catalog generation. If the input has no published catalog for the configured
+  portal identity, playback fails with a log line naming that input instead of starting or discarding a refresh.
+* Stalker EPG import also consumes the portal bulk-EPG endpoint during processing.
 * The bulk-EPG path is streamed and batch-persisted to reduce peak memory pressure on large portals, but portal-specific
   tuning for pathological datasets is still a separate follow-up topic.
 * Supported Stalker playback transports are currently `http` and `https` only. `rtmp://` / `rtsp://` commands are rejected
@@ -985,21 +980,46 @@ and the catalog page limit are configured on the parent input in the Web UI or Y
 
 ### 2.5 Staged Sources (`staged`)
 
-The **staged input** is a first-class input type for pre-formatted playlists. Tuliprox reads the selected playlist
-clusters from the staged source, then stores the merged result in the linked provider input. Stream delivery and API
-requests continue to use that provider input.
+The **staged input** is a first-class input type for pre-formatted playlists. Tuliprox overlays the selected clusters
+of the linked provider with the staged groups, then stores the merged result in that provider input. Stream delivery
+and API requests continue to use the provider input.
 
 This is useful when an external playlist editor already has the desired channel order, groups, and original stream IDs.
-For example, an IPTV editor can provide the Live playlist layout while the actual streams are still opened against the
-Xtream or M3U provider.
+A staged playlist is typically a restructured copy of the provider playlist: the streams stay the same, while group
+names, channel names, and their order may differ. For example, an IPTV editor can provide the Live playlist layout while
+the actual streams are still opened against the Xtream or M3U provider.
 
 **Data flow:**
 
-* `staged input -> provider input`: the staged input is an overlay for that provider. Clusters listed in
-  `staged.clusters` are loaded from the staged input; the remaining clusters are loaded from the provider input itself.
+* `staged input -> provider input`: the staged input is an overlay for that provider. Inside the clusters listed in
+  `staged.clusters`, an `m3u` staged playlist determines all groups and channels. An `xtream` staged playlist replaces
+  matching provider categories and keeps unmatched provider categories. Clusters not listed are loaded from the provider
+  input itself.
   The merged playlist is persisted under the provider input, and streaming/API requests still target the provider input.
 * `staged input -> target` is not supported. Use a normal `m3u` or `xtream` input if the source should be connected
   directly to a target.
+
+**Overlay matching (`xtream` providers):**
+
+* Matching is ID-driven. A staged group overlays the provider category that owns its staged stream IDs, strongest overlap
+  first; when that category is already claimed by a stronger overlap, the group's next-ranked category is used. A group
+  with known provider stream IDs that loses the assignment is added as a new category. When none of its stream IDs are
+  known, an `xtream` staged group is resolved by category ID; an `m3u` staged group skips that step because its category
+  IDs are positional. The group title acts as a last resort. A group title therefore never overrides a stream ID match,
+  so a renamed or split group cannot take over an unrelated category by accident.
+* The overlaid category keeps its own category ID; the staged playlist supplies the group name and channel order.
+  With `staged_type: m3u`, it also supplies the group order.
+* Known streams keep their provider playback URL, including a direct source URL. New streams use the provider address and
+  credentials; for VOD, the staged stream's container metadata supplies the extension when available.
+* Every staged channel needs a numeric provider stream ID in its `header.id`, either from an `xui-id` / `cuid`
+  attribute or from the numeric last URL segment. Rows without one are skipped, a single warning per group reports how
+  many rows were dropped. A group with no usable channels is omitted for `m3u` staged input; for `xtream` staged input,
+  a matching provider category stays in place.
+* A staged group that matches no provider category is added as a new category. Its category ID is reused when it is
+  still free, otherwise Tuliprox assigns an unused ID, so two groups of one cluster never share an ID.
+
+For every other provider type the staged groups of a listed cluster are taken as they are: their group IDs, URLs, and
+channel IDs stay unchanged, and the clusters they cover are replaced completely.
 
 #### Configuration Example (Provider With Staged Live Overlay)
 
@@ -1032,13 +1052,16 @@ inputs:
 | `method`                | Enum   |    No    | `GET`   | HTTP request method (`GET` or `POST`). Not inherited from the provider input.                         |
 | `headers`               | Dict   |    No    |         | Custom HTTP headers for the staged download. Not inherited from the provider input.                   |
 | `staged.for_input`      | String |   Yes    |         | Provider input name. Must reference a non-staged `m3u` or `xtream` input.                             |
-| `staged.clusters`       | List   |    No    | all     | Clusters loaded from the staged input: `live`, `vod`, `series`.                                       |
+| `staged.clusters`       | List   |    No    | all     | Clusters whose categories are overlaid from the staged input: `live`, `vod`, `series`.                |
 
 #### Staged Cluster Behavior & Validation
 
-`staged.clusters` is the group of clusters loaded from the staged input.
+`staged.clusters` names the clusters whose categories are overlaid from the staged input.
 
 * The referenced provider supplies all clusters not listed in `staged.clusters`.
+* Inside a listed cluster of an `xtream` provider, an `m3u` staged playlist determines which groups and channels appear.
+  Provider categories without an `m3u` staged counterpart are omitted. With `staged_type: xtream`, unmatched provider
+  categories remain available. For any other provider type the listed clusters are replaced entirely.
 * `staged.for_input` must reference an existing non-staged `m3u` or `xtream` input.
 * Each provider input can have at most one staged overlay.
 * `staged.clusters` must not be empty.
@@ -1243,6 +1266,7 @@ sources:
 | `sort`             | Object        |    No    |           | Defines ordering for groups and channels after transformations. This affects the final playlist structure seen by clients and can significantly improve navigation quality in IPTV players.                                  |
 | `options`          | Object        |    No    |           | Target-level behavior switches such as logo suppression, duplicate removal, and shared live-stream handling. These options influence memory usage, playlist cleanliness, and reverse-proxy behavior.                         |
 | `output`           | List          |   Yes    |           | Mandatory list of output formats. A single target can generate multiple output representations (e.g., `xtream`, `m3u`, `strm`, `hdhomerun`) from the same transformed result set.                                            |
+| `curation`         | Object        |    No    |           | Optional target-wide catalog policy with Trakt and/or TMDB Trending sources. Mutually exclusive with legacy `output[].trakt`; see [target-wide curation](#target-wide-curation-curation).                                    |
 | `favourites`       | List          |    No    |           | Duplicates final transformed channels into dedicated favorite groups after processing is complete. This adds curated views without changing the original group structure.                                                    |
 | `watch`            | List          |    No    |           | Defines watched group patterns. If matching groups change during updates, Tuliprox emits Messaging events so operational changes become observable automatically.                                                            |
 | `use_memory_cache` | Bool          |    No    | `false`   | If enabled, the final compiled playlist is cached in RAM. This reduces disk access and improves delivery speed, especially for M3U downloads, but increases memory consumption.                                              |
@@ -1292,8 +1316,9 @@ filter:
   persist: 'EpgId IS NOT EMPTY'
 ```
 
-`processing` runs at the normal `F` position. `persist` runs after EPG matching, smart matching, all mappings, merge,
-favourites/Trakt, deduplication, sorting, channel numbering, and counters, immediately before watch evaluation and target
+`processing` runs at the normal `F` position. The target then applies favourites, merges groups, performs post-merge
+content deduplication, evaluates any configured curation selectors (Trakt and/or TMDB), and derives the base and Xtream appearance views.
+`persist` runs after each view is sorted, numbered, and counted, immediately before output filters, watch evaluation, and
 persistence. Output-level filters remain plain strings and have no configurable stage.
 
 You can define complex strings or regex patterns exactly once in [template.yml](./template.md)
@@ -1667,6 +1692,205 @@ visible IDs change.
 
 ---
 
+### Target-wide curation (`curation`)
+
+Curation is operator-configured discovery over content already available in this target. It neither imports new playback
+sources nor uses personal watch history, progress, OAuth or recommendations. TMDB Trending works without a Trakt Client ID.
+Legacy [`output[].trakt`](#trakt-object-in-xtream-output) remains supported; existing configurations need no migration.
+
+Start with `catalog_selection: full` to retain the ordinary catalog and add Xtream categories for locally available matches:
+
+```yaml
+# A target under sources[].targets, linked to your authorized movie/TV inputs.
+name: discovery
+curation:
+  catalog_selection: full
+  include_xtream_base_categories: true
+  tmdb:
+    api:
+      access_token: "${env:TMDB_READ_ACCESS_TOKEN}"
+    trending:
+      - kind: movie
+        time_window: week
+        limit: 100
+        category_name: TMDB Weekly Movies
+      - kind: tv
+        time_window: day
+        limit: 100
+        category_name: TMDB Daily TV
+output:
+  - type: xtream
+  - type: m3u
+    filename: discovery.m3u
+```
+
+Obtain your application's **API Read Access Token** from [TMDB API settings](https://www.themoviedb.org/settings/api).
+Configure the raw token without a `Bearer` prefix, preferably through an environment variable. It is sent as a sensitive
+Authorization header, never as a query parameter. There is no bundled discovery token, `api_key` alias, configurable TMDB
+origin, or fallback to `metadata_update.tmdb`. Discovery credentials and enablement are independent of metadata enrichment.
+Missing/blank credentials or values that cannot form an HTTP header leave configuration readable but make an enabled
+selector unavailable without a request. Rejected/expired credentials also fail the refresh, rather than yielding an empty feed.
+
+#### Curation policy and source parameters
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Enables the whole curation block. |
+| `catalog_selection` | `full` | `full` retains the eligible catalog; `curated` keeps the union of selected VOD/series subjects and series children, plus Live. |
+| `include_xtream_base_categories` | `true` | Includes ordinary VOD/Series groups in Xtream alongside projections. Does not affect Live or M3U/STRM grouping. |
+| `trakt` | absent | Optional source with `enabled`, `api`, `lists`, `charts`; reuses the [Trakt selector parameters](#trakt-parameters). |
+| `tmdb` | absent | Optional TMDB Trending source. |
+| `trakt.enabled`, `tmdb.enabled` | `true` | Disabled sources make no requests and contribute no required selectors. |
+| `tmdb.api.access_token` | empty | Explicit TMDB application Read Access Token, required for an active fetch. |
+| `tmdb.trending` | `[]` | Configured Trending selectors. Each active entry is required. |
+| `tmdb.trending[].kind` | required | `movie` or `tv`; no mixed/person endpoint. |
+| `tmdb.trending[].time_window` | required | `day` or `week`. |
+| `tmdb.trending[].limit` | `100` | Integer **1..=500**: up to this many unique remote references, before local matching. |
+| `tmdb.trending[].create_xtream_category` | `true` | Projects a category in Xtream; false makes the selector selection-only. |
+| `tmdb.trending[].category_name` | absent | Nonblank name required for an active projection; retained but unused for selection-only entries. |
+
+There is one catalog policy per target, not one per provider or output. `curation.trakt` does not accept its own
+`catalog_selection` or `include_xtream_base_categories`. An active projection, or suppression of Xtream base categories,
+requires an Xtream output. Projection names involving TMDB must be unique within each media cluster after trimming,
+lowercasing and accent removal, including overlaps with Trakt selectors. A Trakt `both` list reserves both clusters;
+selection-only and disabled sources reserve neither. Existing Trakt-only and ordinary base-group merging is unchanged.
+Category names still participate in alias identity: renaming them does not promise stable virtual IDs.
+
+An enabled non-default policy without active selectors is rejected. An all-default source-less block is a no-op.
+Disabling the whole block preserves incomplete category/credential edits without executing them. Required enum fields
+(`kind`, `time_window`), unknown-field checks and declaration ownership checks still apply to disabled drafts. `limit` must
+remain an integer in range even when the target, block or source is disabled: null, zero, negatives, fractions, quoted
+numbers and overflow are errors, not defaults or clamped values. Saving omits the default 100 and retains non-default limits.
+
+#### Bounded discovery, matching and failure behavior
+
+TMDB requests `/3/trending/movie/{day|week}` or `/3/trending/tv/{day|week}`, with `language=en-US&page=p`, sequentially
+from page 1. Pagination is internal transport, not operator configuration. There is no remote `limit` parameter, Discover
+filtering or details lookup. N counts unique **(movie/TV kind, positive TMDB ID)** references, not local titles, versions,
+aliases or episodes. An unavailable local title still consumes a reference; Tuliprox does not keep searching for N matches.
+
+Selection stops at the Nth unique reference, but the entire last response is read and validated, including duplicates and
+the suffix beyond N. An invalid record anywhere fails the selector. Duplicates keep the first text and rank. Rank is the
+observed row ordinal across actual page lengths, including duplicates, not an ordinal among unique IDs or a fixed page-size
+calculation. No extra page is requested after N or a valid end. A valid end before N is also complete.
+
+Each response must echo the requested page and have coherent totals. A short page alone is not an end. Totals may change;
+the current page's last-page indication is used without assuming a remote snapshot. An empty response is valid only on
+page 1 with zero results and total pages 0 or 1. A later empty page, or a later page with no new IDs (even the last page),
+fails rather than publishing a partial prefix. This deliberately conservative rule can reject a legitimately overlapping
+page. Trending pagination has empirical support; TMDB's public Trending references do not currently document the `page`
+query parameter. If its behavior changes, these checks fail closed, not back to first-page discovery.
+
+Internal guards are independent of `limit` and cannot be configured:
+
+| Resource | Per request | Per TMDB selector | Shared TMDB acquisition batch per target/run |
+| --- | --- | --- | --- |
+| Admitted GET attempts | 1 | 32 | 128 |
+| Absolute deadline | 15 seconds | 60 seconds | 180 seconds |
+| Decoded bytes consumed | 1 MiB | 8 MiB | 32 MiB |
+
+The dedicated configured HTTP profile preserves proxy/authentication, trusted CAs and connect timeout, but always verifies
+TLS certificates and hostnames, even when `accept_insecure_ssl_certificates: true`. A TLS-inspecting proxy with an untrusted
+certificate cannot complete TMDB discovery until valid CA trust is established. This exception does not change Trakt,
+metadata or playback clients. The profile never follows redirects or replays requests. Client construction failures have
+no unconfigured fallback. Attempts are counted before
+sending, and consumed decoded bytes include duplicate/suffix rows and failed bodies; size detection may consume one extra
+byte on failure, never on success. These are not TLS/compressed-byte or total-memory limits. Deadlines cover headers,
+decoding and normalization, do not restart per page/chunk, and are checked before success. They bound TMDB acquisition,
+not inputs, Trakt, local matching or the entire refresh. Acquisition finishes before local matching. There is no feed
+cache or stale-feed fallback. A valid N may not fit these guards: needing another request or byte after exhaustion fails;
+completing exactly at a request/byte boundary succeeds. Do not assume 100 references always require five pages or yield
+100 matches.
+
+Matching is exact by positive TMDB ID **and** movie/TV kind; there is no title/year fuzzy fallback for TMDB. Local items
+without a matching ID are not selected. Distinct local subjects sharing an ID remain distinct; duplicate feed entries keep
+the first rank. Day/week selectors keep independent ranks and memberships; their base selection is unioned by local
+subject, not remote ID. Changing only the limit preserves surviving subject/alias identities when local UUID and category
+name remain unchanged. Remote order applies within each projected category, without globally reordering the base catalog.
+Existing target sorting and filters still apply afterwards. M3U and STRM consume selected ordinary entries, not the new
+Xtream aliases; HDHomeRun follows its existing underlying output.
+
+All enabled Trakt and TMDB selectors, including selection-only selectors, must complete before publication in **both**
+`full` and `curated`. A timeout, resource exhaustion, unsuccessful status, malformed/inconsistent page, invalid ID/media
+kind, lack of pagination progress or any redirect prevents changes to finalized target IDs, files, caches and watches. Successful sibling
+feeds do not authorize partial publication. The first failed run publishes nothing; later failures retain prior artifacts.
+`full` does not make configured discovery optional. Writers remain best-effort after successful curation admission; this
+is not a cross-output storage transaction.
+
+A valid initial empty page and a complete selection with **no local matches are successes**, not errors. In `curated`, either can clear
+published VOD/Series while retaining eligible Live. This can happen when the library lacks trending titles or TMDB IDs.
+Enrichment is separate: rebuild the target after IDs become available. Start with `full` if this narrowing is not intended.
+
+#### Selection-only and mixed sources
+
+M3U/STRM-only targets are supported by explicitly disabling Xtream projection:
+
+```yaml
+name: weekly-m3u
+curation:
+  catalog_selection: curated
+  tmdb:
+    api:
+      access_token: "${env:TMDB_READ_ACCESS_TOKEN}"
+    trending:
+      - kind: movie
+        time_window: week
+        limit: 100
+        create_xtream_category: false
+output:
+  - type: m3u
+    filename: weekly.m3u
+```
+
+To combine sources, add a Trakt source inside the same `curation` block. For example:
+
+```yaml
+trakt:
+  api:
+    api_key: "${env:TRAKT_CLIENT_ID}"
+  charts:
+    - kind: movies
+      chart: popular
+      category_name: Trakt Popular Movies
+      tmdb_only: true
+```
+
+Both providers read the same eligible pre-projection catalog. In `curated`, their selected subjects are unioned once for
+normal outputs; each projected Xtream category retains its own memberships/rank. Either provider failing blocks the run.
+
+#### Explicit migration and Source Editor
+
+At most one non-null declaration surface is allowed: `target.curation` **or** legacy `output[].trakt`. Declaring both is
+an error even if one is disabled, empty or uses only defaults. Null is equivalent to absence. There is no implicit merge,
+precedence or automatic migration.
+
+To migrate an existing Trakt target deliberately:
+
+1. Move its whole-block `enabled`, `catalog_selection` and `include_xtream_base_categories` to `target.curation`.
+2. Move its `api`, `lists` and `charts` into `curation.trakt`; leave this source enabled (the default).
+3. Remove `output[].trakt`. Leave the rest of the output configuration in place.
+
+This preserves the original policy, including a globally disabled block, and the legacy matching/category identity rules.
+Equivalent canonical Trakt-only configurations keep their existing aliases/virtual IDs. Add TMDB only after deliberately
+choosing the shared policy; all newly enabled selectors become required.
+
+The new block is YAML-owned. Source Editor shows a read-only target summary, preserves the block when editing other
+fields, and hides legacy Trakt controls on its connected outputs. Edit provider/policy settings in YAML; there is no TMDB
+query-builder or migration wizard. Read/save/reload preserves configured meaning and ownership, not YAML formatting or
+spelling of defaults/aliases. Backend validation still rejects conflicting declarations introduced by graph edits.
+
+#### TMDB attribution and usage terms
+
+The dashboard version card's **Credits** button displays an approved TMDB logo and the required notice:
+
+> This product uses the TMDB API but is not endorsed or certified by TMDB.
+
+The developer API is free for non-commercial use with attribution. Commercial deployments must assess TMDB's commercial
+licensing requirements; configuring a token does not grant unrestricted commercial use or rights to playback content.
+See the [TMDB FAQ](https://developer.themoviedb.org/docs/faq),
+[branding guidance](https://www.themoviedb.org/about/logos-attribution) and
+[commercial API information](https://www.themoviedb.org/api-for-business).
+
 ### 3.2.7 Output Formats (`output`)
 
 A target can be exported to multiple formats simultaneously. The target-level filter, rename, mapping, and sort
@@ -1697,6 +1921,8 @@ output:
     update_strategy: instant
     trakt:
       enabled: true
+      catalog_selection: curated
+      include_xtream_base_categories: true
       api:
         # Despite the compatible field name, this value is the Trakt Client ID.
         api_key: "${env:TRAKT_CLIENT_ID}"
@@ -1707,6 +1933,7 @@ output:
         - user: "gary"
           list_slug: "latest-tv"
           category_name: "Trending TV"
+          create_xtream_category: true
           content_type: series
           fuzzy_match_threshold: 80
 ```
@@ -1720,7 +1947,7 @@ output:
 | `skip_video_direct_source`  | Bool   |    No    | `true`    | If `true`, Tuliprox ignores provider `direct_source` values for movies/VOD. This improves consistency across clients that otherwise may bypass Tuliprox for video playback.                           |
 | `skip_series_direct_source` | Bool   |    No    | `true`    | If `true`, Tuliprox ignores provider `direct_source` values for series entries. This ensures Tuliprox stays in control of series playback URL generation and proxy behavior.                          |
 | `update_strategy`           | Enum   |    No    | `instant` | `instant` writes changes immediately, while `bundled` batches write operations. This directly trades off freshness versus disk I/O load during background metadata enrichment and output maintenance. |
-| `trakt`                     | Object |    No    |           | Trakt.tv integration block. Tuliprox can fetch Trakt lists, fuzzy-match them against playlist entries, and inject matched VOD or series entries into generated virtual categories.                    |
+| `trakt`                     | Object |    No    |           | Trakt.tv target-wide catalog selection and Xtream category-projection block.                                                                                                                          |
 | `filter`                    | String |    No    |           | Optional output-level filter for the Xtream export only. Useful when the same target should expose different subsets to different output formats.                                                     |
 
 > **Note:** IPTV players vary in how they resolve streams: some use the direct-source attribute, while others
@@ -1735,9 +1962,12 @@ output:
 
 #### `trakt` Object in Xtream Output
 
-Trakt.tv is an online platform for tracking, organizing, and discovering movies and TV shows.
-Tuliprox can query Trakt lists and match playlist entries using Jaro-Winkler-style fuzzy matching.
-Matching entries are then added to new virtual categories inside the Xtream output.
+This is the compatible legacy declaration. For TMDB or combined sources use
+[target-wide `curation`](#target-wide-curation-curation) instead; do not declare both surfaces on one target.
+
+Trakt.tv is an online platform for tracking, organizing, and discovering movies and TV shows. Tuliprox evaluates every
+configured list and chart against the target's merged, deduplicated VOD and series catalog. The resulting exact-entry
+memberships can select the target-wide catalog and independently create compatibility alias categories in Xtream.
 
 You can define a `Trakt` config like
 
@@ -1762,6 +1992,8 @@ sources:
             skip_series_direct_source: true
             trakt:
               enabled: true
+              catalog_selection: curated
+              include_xtream_base_categories: true
               api:
                 # Despite the compatible field name, this value is the Trakt Client ID.
                 api_key: "${env:TRAKT_CLIENT_ID}"
@@ -1772,17 +2004,19 @@ sources:
                 - user: "linaspurinis"
                   list_slug: "top-watched-movies-of-the-week"
                   category_name: "📈 Top Weekly Movies"
+                  create_xtream_category: true
                   content_type: vod
                   fuzzy_match_threshold: 80
                 - user: "garycrawfordgc"
                   list_slug: "latest-tv-shows"
-                  category_name: "📺 Latest TV Shows"
+                  create_xtream_category: false
                   content_type: series
                   fuzzy_match_threshold: 80
               charts:
                 - kind: movies
                   chart: trending
                   category_name: "🔥 Trending Movies"
+                  create_xtream_category: true
                   tmdb_only: true
                 - kind: shows
                   chart: popular
@@ -1790,9 +2024,10 @@ sources:
                   tmdb_only: true
 ```
 
-This configuration creates additional virtual categories populated with matched entries from the configured Trakt user
-lists and public Trakt charts. Define `TRAKT_CLIENT_ID` in the environment of the Tuliprox process before enabling the
-block.
+This example selects one catalog for the target: all Live entries plus VOD/series roots selected by at least one Trakt
+selector, including the selected series' episode closure. The first list and both charts also create named Xtream alias
+categories. The second list is selection-only and therefore needs no `category_name`. M3U and STRM outputs on the same
+target receive selected normal entries, never those Xtream aliases.
 
 The serialized field remains `api.api_key` for configuration compatibility, but its value is the Client ID of your
 Trakt API application and is sent in the `trakt-api-key` header. Tuliprox does not bundle a Client ID and never falls
@@ -1800,31 +2035,46 @@ back to another identity. Creating Trakt API applications currently requires act
 response only means that Trakt denied the request; check both the configured Client ID and access to the requested
 resource rather than assuming that every `403` proves a particular account state.
 
-If lists or charts are configured while the Client ID is blank or cannot be used as an HTTP header, Tuliprox makes no
-Trakt request, logs one target-scoped warning, and skips only optional Trakt curation. The rest of target processing
-continues. A disabled block, or a block with no lists or charts, remains a silent no-op.
+Every enabled list and chart is required for one refresh. A missing or invalid Client ID makes no request; credential,
+transport, status, JSON, interrupted-pagination, or truncated-pagination failures stop that target before IDs, files,
+caches, or watches are changed. A complete response with zero references, or with no local matches, remains successful.
+With `catalog_selection: curated`, that complete result clears VOD/Series while preserving Live. A disabled block, or a
+source-less block whose policies all use their defaults, remains a no-op. Input quality/force decisions are resolved
+before this boundary: curation cannot make an unauthorized empty input publishable, and even force-authorized emptiness
+waits for every required selector to complete. After a complete curation result enters publication, independent writer
+failures retain the existing best-effort cross-output behavior and are reported as writer failures rather than as Trakt
+source failures.
 
 ##### Trakt Parameters
 
-| Parameter                        | Type    | Required | Default                | Technical Impact & Background                                                                                                                           |
-| :------------------------------- | :------ | :------: | :--------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `enabled`                        | Bool    | No       | `true`                 | Enables Trakt curation. Keep it `false` until an explicit Client ID is configured.                                                                      |
-| `api.api_key`                    | String  | Yes      |                        | Compatible field that stores the Trakt Client ID. There is no bundled fallback; use an explicit value such as `${env:TRAKT_CLIENT_ID}`.                 |
-| `api.version`                    | String  | No       | `"2"`                  | API version header value. This ensures Tuliprox formats requests against the correct Trakt API version.                                                 |
-| `api.url`                        | String  | No       | `https://api.trakt.tv` | Base API URL for Trakt requests. This defines the remote endpoint Tuliprox queries for list data.                                                       |
-| `api.user_agent`                 | String  | No       |                        | Optional `User-Agent` used for Trakt API requests. This can help satisfy API gateway expectations or deployment-specific request policies.              |
-| `lists[].user`                   | String  | Yes      |                        | Trakt username owning the list. This identifies which account namespace Tuliprox fetches list data from.                                                |
-| `lists[].list_slug`              | String  | Yes      |                        | Trakt list slug. Combined with `user`, this uniquely identifies the remote list to load.                                                                |
-| `lists[].category_name`          | String  | Yes      |                        | Name of the generated virtual category inside Tuliprox's Xtream output. This controls where matched entries appear to clients.                          |
-| `lists[].content_type`           | Enum    | Yes      |                        | `vod` or `series`. This determines which class of playlist entries Tuliprox will attempt to match and inject into the generated category.               |
-| `lists[].tmdb_only`              | Bool    | No       | `false`                | If `true`, only exact TMDB-id matches are accepted for this list, disabling title/year fuzzy fallback and reducing false positives.                     |
-| `lists[].fuzzy_match_threshold`  | Integer | No       |                        | Fuzzy matching threshold for title matching. Higher values reduce false positives but may miss loosely matching items.                                  |
-| `charts[]`                       | List    | No       | `[]`                   | Public Trakt chart definitions. Unlike `lists[]`, these are system charts and do not have a user/list owner.                                            |
-| `charts[].kind`                  | Enum    | Yes      |                        | `movies` or `shows`. Aliases such as `movie`, `vod`, `show`, `series`, and `tvshows` are accepted.                                                      |
-| `charts[].chart`                 | Enum    | Yes      |                        | Public chart to fetch. MVP supports `trending` and `popular`.                                                                                           |
-| `charts[].category_name`         | String  | Yes      |                        | Name of the generated virtual category inside Tuliprox's Xtream output.                                                                                 |
-| `charts[].tmdb_only`             | Bool    | No       | `false`                | If `true`, only exact TMDB-id matches are accepted. This is recommended for dynamic charts to avoid fuzzy false positives.                              |
-| `charts[].fuzzy_match_threshold` | Integer | No       |                        | Fuzzy matching threshold for chart title matching when `tmdb_only` is not enabled.                                                                      |
+| Parameter                         | Type    | Required    | Default                | Technical Impact & Background                                                                                               |
+| :-------------------------------- | :------ | :---------: | :--------------------- | :-------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                         | Bool    | No          | `true`                 | Enables Trakt curation. Disabled blocks may retain incomplete editor values without running selectors.                      |
+| `catalog_selection`               | Enum    | No          | `full`                 | `full` keeps the complete eligible target catalog; `curated` keeps all Live plus selected VOD/Series and series children.   |
+| `include_xtream_base_categories`  | Bool    | No          | `true`                 | Includes normal VOD/Series categories in Xtream independently of catalog selection and alias-category creation.             |
+| `api.api_key`                     | String  | Yes         |                        | Compatible field containing the explicit Trakt Client ID, for example `${env:TRAKT_CLIENT_ID}`.                             |
+| `api.version`                     | String  | No          | `"2"`                  | API version header value.                                                                                                   |
+| `api.url`                         | String  | No          | `https://api.trakt.tv` | Base API URL for Trakt requests.                                                                                            |
+| `api.user_agent`                  | String  | No          |                        | Optional `User-Agent` for Trakt requests.                                                                                   |
+| `lists[].user`                    | String  | Yes         |                        | Trakt username owning the list.                                                                                             |
+| `lists[].list_slug`               | String  | Yes         |                        | Trakt list slug within the user's namespace.                                                                                |
+| `lists[].create_xtream_category`  | Bool    | No          | `true`                 | Creates a category-scoped Xtream alias projection. `false` keeps the list as a required selection-only selector.            |
+| `lists[].category_name`           | String  | Conditional |                        | Required and non-blank only when `create_xtream_category` is `true`; a saved value is preserved while creation is disabled. |
+| `lists[].content_type`            | Enum    | Yes         |                        | `vod`, `series`, or `both`; direct matching uses VOD/series roots, never episode titles.                                    |
+| `lists[].tmdb_only`               | Bool    | No          | `false`                | Accepts only exact TMDB-id matches, disabling title/year fuzzy fallback.                                                    |
+| `lists[].fuzzy_match_threshold`   | Integer | No          |                        | Fuzzy title-match threshold when `tmdb_only` is not enabled.                                                                |
+| `charts[]`                        | List    | No          | `[]`                   | Public, non-OAuth Trakt chart definitions.                                                                                  |
+| `charts[].kind`                   | Enum    | Yes         |                        | `movies` or `shows`; the documented singular/VOD/series aliases remain accepted.                                            |
+| `charts[].chart`                  | Enum    | Yes         |                        | Public chart; currently `trending` or `popular`.                                                                            |
+| `charts[].create_xtream_category` | Bool    | No          | `true`                 | Creates the chart's named Xtream alias; `false` leaves it as a required selection-only selector.                            |
+| `charts[].category_name`          | String  | Conditional |                        | Required and non-blank only when `create_xtream_category` is `true`.                                                        |
+| `charts[].tmdb_only`              | Bool    | No          | `false`                | Accepts only exact TMDB-id matches.                                                                                         |
+| `charts[].fuzzy_match_threshold`  | Integer | No          |                        | Fuzzy title-match threshold when `tmdb_only` is not enabled.                                                                |
+
+Existing configurations omit all three new policy controls and therefore retain Case A behavior: `full` catalog,
+Xtream base categories, and one category for every configured selector. Filters at `filter.persist` and inside output
+blocks run on their concrete post-projection appearance; they can hide an appearance but cannot reintroduce a subject
+that was absent from the eligible catalog.
 
 The `charts[]` MVP intentionally supports only public, non-OAuth Trakt charts. User-specific recommendations and
 account-scoped history feeds are not fetched by this block.

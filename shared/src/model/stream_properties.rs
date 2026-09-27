@@ -799,6 +799,22 @@ impl StreamProperties {
     }
 }
 
+/// Field names accepted by resource-proxy endpoints. This is deliberately defined beside the
+/// resource traversal and selector so adding a new endpoint-visible resource has one review site.
+///
+/// Stream URLs are not resources: serving them here would sidestep the stream routes and their
+/// admission accounting.
+pub fn is_resource_field_name(field: &str) -> bool {
+    if matches!(field, "logo" | "logo_small" | "cover" | "movie_image" | "nfo_cover_big" | "nfo_movie_image")
+        || field.starts_with("backdrop_path")
+        || field.starts_with("nfo_backdrop_path")
+    {
+        return true;
+    }
+    parse_season_field(field).is_some_and(|(_, field)| matches!(field.as_str(), "cover" | "cover_tmdb" | "cover_big"))
+        || parse_season_episode_field(field).is_some_and(|(_, _, field)| field == "movie_image")
+}
+
 fn parse_season_field(s: &str) -> Option<(u32, String)> {
     let mut parts = s.split('_');
 
@@ -1392,5 +1408,26 @@ mod tests {
         assert_eq!(current.bitrate, 2_500_000);
         assert_eq!(current.last_probed_timestamp, Some(200));
         assert_eq!(current.last_success_timestamp, Some(150));
+    }
+
+    #[test]
+    fn resource_field_names_exclude_stream_urls() {
+        for resource in [
+            "logo",
+            "logo_small",
+            "cover",
+            "movie_image",
+            "nfo_cover_big",
+            "backdrop_path",
+            "backdrop_path1",
+            "nfo_backdrop_path",
+            "nfo_s_2_cover",
+            "nfo_ep_2_5_movie_image",
+        ] {
+            assert!(is_resource_field_name(resource), "{resource}");
+        }
+        for not_a_resource in ["url", "name", "chno", "caption", "epg_channel_id", "stream_url", "nfo_s_2_title"] {
+            assert!(!is_resource_field_name(not_a_resource), "{not_a_resource}");
+        }
     }
 }

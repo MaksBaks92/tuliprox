@@ -18,7 +18,7 @@ use axum::response::IntoResponse;
 use serde_json::json;
 use shared::{
     model::{InputPersistence, M3uPlaylistItem, TargetType, UiPlaylistItem, XtreamCluster, XtreamPlaylistItem},
-    utils::{concat_path, concat_path_leading_slash, interner_gc, obfuscate_text, Internable},
+    utils::{concat_path, concat_path_leading_slash, interner_gc, seal_web_ui_resource_url, Internable},
 };
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -97,7 +97,11 @@ pub(in crate::api::endpoints) async fn get_playlist_for_target(
     (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": "Invalid Arguments"}))).into_response()
 }
 
-fn rewrite_resource_url(encrypt_secret: &[u8; 16], resource_url: &str, item: UiPlaylistItem) -> UiPlaylistItem {
+pub(in crate::api::endpoints) fn rewrite_resource_url(
+    encrypt_secret: &[u8; 16],
+    resource_url: &str,
+    item: UiPlaylistItem,
+) -> UiPlaylistItem {
     if item.logo.is_empty() {
         return item;
     }
@@ -105,8 +109,18 @@ fn rewrite_resource_url(encrypt_secret: &[u8; 16], resource_url: &str, item: UiP
     if item.logo.starts_with('/') {
         return item;
     }
-    item.logo = concat_path(resource_url, &obfuscate_text(encrypt_secret, &item.logo)).intern();
+    item.logo = concat_path(resource_url, &seal_web_ui_resource_url(encrypt_secret, &item.logo)).intern();
     item
+}
+
+/// Item as handed to the Web UI: icon wrapped into a proxy link, playback URL routed through the
+/// resource route.
+///
+/// Both rewrites live in one place, so a preview path cannot ship the icon rewrite and forget the
+/// other way around: an icon that is not wrapped can name a destination internal to this instance.
+fn preview_item(encrypt_secret: &[u8; 16], resource_url: &str, input_id: u16, item: UiPlaylistItem) -> UiPlaylistItem {
+    let item = rewrite_resource_url(encrypt_secret, resource_url, item);
+    rewrite_stalker_playback_url(encrypt_secret, resource_url, input_id, item)
 }
 
 fn rewrite_stalker_playback_url(
@@ -117,7 +131,7 @@ fn rewrite_stalker_playback_url(
 ) -> UiPlaylistItem {
     let locator =
         format!("{STALKER_RESOURCE_SCHEME}{input_id}/{}/{}", item.xtream_cluster.as_stream_type(), item.provider_id);
-    item.url = concat_path(resource_url, &obfuscate_text(encrypt_secret, &locator)).intern();
+    item.url = concat_path(resource_url, &seal_web_ui_resource_url(encrypt_secret, &locator)).intern();
     item
 }
 
@@ -128,18 +142,28 @@ pub(in crate::api::endpoints) async fn get_playlist_for_input(
     accept: Option<&str>,
 ) -> impl IntoResponse + Send {
     if let Some(input) = cfg_input {
+        // Icon URLs are wrapped into a proxy link, so the browser never receives a destination that
+        // may be internal to this Tuliprox instance.
+        let config = app_state.app_config.config.load();
+        let web_ui_path = config.web_ui.as_ref().and_then(|web_ui| web_ui.path.as_ref()).map_or("", String::as_str);
+        let resource_url = concat_path_leading_slash(web_ui_path, "api/v1/playlist/resource");
+        let encrypt_secret = app_state.get_encrypt_secret();
         if input.input_type.is_xtream() {
             let Some(channel_iterator) = iter_raw_xtream_input_playlist(&app_state.app_config, input, cluster).await
             else {
                 return empty_json_list_response();
             };
-            let converted_stream = channel_iterator.map(|entry| entry.map(UiPlaylistItem::from));
+            let converted_stream = channel_iterator.map(move |entry| {
+                entry.map(|item| rewrite_resource_url(&encrypt_secret, &resource_url, UiPlaylistItem::from(item)))
+            });
             return stream_json_or_bin_response_try_stream(accept, converted_stream).into_response();
         } else if input.input_type.is_m3u() {
             let Some(channels) = iter_raw_m3u_input_playlist(&app_state.app_config, input, Some(cluster)).await else {
                 return empty_json_list_response();
             };
-            let converted_stream = channels.map(|entry| entry.map(UiPlaylistItem::from));
+            let converted_stream = channels.map(move |entry| {
+                entry.map(|item| rewrite_resource_url(&encrypt_secret, &resource_url, UiPlaylistItem::from(item)))
+            });
             return stream_json_or_bin_response_try_stream(accept, converted_stream).into_response();
         } else if input.input_type.is_stalker() {
             // TODO refactor
@@ -166,16 +190,11 @@ pub(in crate::api::endpoints) async fn get_playlist_for_input(
                 return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": error_strings.join(", ")})))
                     .into_response();
             }
-            let config = app_state.app_config.config.load();
-            let web_ui_path = config.web_ui.as_ref().and_then(|web_ui| web_ui.path.as_ref()).map_or("", String::as_str);
-            let resource_url = concat_path_leading_slash(web_ui_path, "api/v1/playlist/resource");
-            let encrypt_secret = app_state.get_encrypt_secret();
             let channels: Vec<UiPlaylistItem> = fetch
                 .groups
                 .iter()
                 .flat_map(|group| group.channels.iter())
-                .map(UiPlaylistItem::from)
-                .map(|item| rewrite_stalker_playback_url(&encrypt_secret, &resource_url, input.id, item))
+                .map(|item| preview_item(&encrypt_secret, &resource_url, input.id, UiPlaylistItem::from(item)))
                 .collect();
             interner_gc();
             return json_or_bin_response(accept, &channels).into_response();
@@ -262,12 +281,7 @@ pub(in crate::api::endpoints) async fn get_playlist_for_custom_provider(
                 let input_id = input.id;
                 let converted_stream =
                     tokio_stream::iter(result.into_iter().flat_map(|g| g.channels).map(move |pli| {
-                        rewrite_stalker_playback_url(
-                            &encrypt_secret,
-                            &resource_url,
-                            input_id,
-                            UiPlaylistItem::from(&pli),
-                        )
+                        preview_item(&encrypt_secret, &resource_url, input_id, UiPlaylistItem::from(&pli))
                     }));
                 stream_json_or_bin_response_stream(accept, converted_stream).into_response()
             }
@@ -280,10 +294,10 @@ pub(in crate::api::endpoints) async fn get_playlist_for_custom_provider(
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_resource_url, stalker_refresh_pending_response};
+    use super::{preview_item, rewrite_resource_url, stalker_refresh_pending_response};
     use shared::{
         model::{PlaylistItemType, UiPlaylistItem, XtreamCluster},
-        utils::{obfuscate_text, Internable},
+        utils::{open_web_ui_resource_url, seal_web_ui_resource_url, Internable},
     };
 
     fn sample_item(logo: &str) -> UiPlaylistItem {
@@ -340,8 +354,36 @@ mod tests {
         let item = sample_item("https://example.com/poster.jpg");
 
         let rewritten = rewrite_resource_url(&secret, "/api/v1/playlist/resource", item);
-        let expected_suffix = obfuscate_text(&secret, "https://example.com/poster.jpg");
+        let expected_suffix = seal_web_ui_resource_url(&secret, "https://example.com/poster.jpg");
 
         assert_eq!(rewritten.logo.as_ref(), format!("/api/v1/playlist/resource/{expected_suffix}"));
+    }
+
+    #[test]
+    fn preview_item_wraps_icon_and_routes_playback() {
+        let secret = [7u8; 16];
+        let item = sample_item("http://192.168.1.20/logo.png");
+
+        let previewed = preview_item(&secret, "/api/v1/playlist/resource", 5, item);
+
+        assert!(previewed.logo.starts_with("/api/v1/playlist/resource/"), "{}", previewed.logo);
+        assert!(!previewed.logo.contains("192.168.1.20"), "{}", previewed.logo);
+        let playback = previewed.url.trim_start_matches("/api/v1/playlist/resource/");
+        assert_ne!(playback, previewed.url.as_ref(), "playback URL must be wrapped too");
+        assert_eq!(
+            open_web_ui_resource_url(&secret, playback).expect("decodable playback link"),
+            "stalker://5/live/provider"
+        );
+    }
+
+    #[test]
+    fn rewrite_resource_url_hides_private_destinations_from_the_client() {
+        let secret = [7u8; 16];
+        let item = sample_item("http://192.168.1.20/logo.png");
+
+        let rewritten = rewrite_resource_url(&secret, "/api/v1/playlist/resource", item);
+
+        assert!(rewritten.logo.starts_with("/api/v1/playlist/resource/"), "{}", rewritten.logo);
+        assert!(!rewritten.logo.contains("192.168.1.20"), "{}", rewritten.logo);
     }
 }

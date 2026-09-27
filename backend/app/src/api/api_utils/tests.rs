@@ -1095,6 +1095,7 @@ async fn forced_legacy_hls_test_response(
         provider: Arc::clone(&input.name),
         stream_url: origin_url.as_str().intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -1243,6 +1244,7 @@ async fn forced_reopen_stays_on_pinned_provider_account() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_a}/live/1.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -1322,6 +1324,7 @@ async fn overlapping_vod_range_requests_return_correct_account_bytes() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_addr}/movie/1.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -1440,6 +1443,7 @@ async fn parallel_series_range_requests_keep_both_claims_active() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_addr}/series/1.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -1790,6 +1794,7 @@ fn load_test_session(input: &ConfigInput, origin_addr: SocketAddr, token: &str, 
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_addr}/live/42.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         user_agent_stream_index: None,
         addr,
         socket_bound: false,
@@ -2075,6 +2080,7 @@ async fn direct_ts_eof_before_first_byte_releases_slot_without_idle_lease() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_addr}/live/42.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -2164,6 +2170,7 @@ async fn direct_ts_abort_while_waiting_for_first_byte_releases_exact_request() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_addr}/live/42.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -2529,6 +2536,7 @@ async fn parallel_vod_abort_preserves_sibling_claim_and_provider_stickiness() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_addr}/movie/1.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -2688,6 +2696,7 @@ async fn parallel_series_abort_then_seek_reuses_account_without_stale_claim() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_addr}/series/1.ts").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -3305,6 +3314,7 @@ async fn catchup_abort_seek_and_window_change_preserve_correct_affinity() {
         provider: Arc::clone(&input.name),
         stream_url: format!("http://{origin_a}/timeshift/1.ts?window={window}").intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         user_agent_stream_index: None,
         addr: client_addr,
         socket_bound: false,
@@ -3444,6 +3454,7 @@ async fn dash_stream_request_remains_redirect_and_preserves_provider_affinity() 
         ..ConfigInput::default()
     });
     let target = Arc::new(ConfigTarget {
+        curation: None,
         id: 1,
         name: "target_dash".to_string(),
         enabled: true,
@@ -3879,6 +3890,245 @@ async fn resolve_streaming_strategy_honors_forced_provider_fallback_policy() {
 }
 
 #[tokio::test]
+async fn resolve_streaming_strategy_rewrites_url_on_fallback_even_when_accept_requested_stream_url_is_true() {
+    let app_state = create_test_dual_provider_app_state();
+    let input_name = "provider_1".intern();
+    let input =
+        app_state.app_config.sources.load().get_input_by_name(&input_name).cloned().unwrap_or_else(|| unreachable!());
+    let pinned_provider = "provider_1".intern();
+    let busy_addr: SocketAddr = "127.0.0.1:55304".parse().unwrap_or_else(|_| unreachable!());
+    let fallback_addr: SocketAddr = "127.0.0.1:55305".parse().unwrap_or_else(|_| unreachable!());
+    let stream_url = "http://provider-1.example/movie/user1/pass1/1.mkv";
+
+    let busy = app_state.active_provider.acquire_exact_connection_with_grace(
+        &pinned_provider,
+        &busy_addr,
+        false,
+        0,
+        crate::api::model::ConnectionKind::Normal,
+    );
+    assert!(busy.is_some(), "setup should occupy the pinned provider");
+
+    let fallback = resolve_streaming_strategy(
+        &app_state,
+        stream_url,
+        &create_test_fingerprint(fallback_addr),
+        &input,
+        StreamingAcquireOptions {
+            force_provider: Some(&pinned_provider),
+            allow_forced_provider_fallback: true,
+            allow_provider_grace: false,
+            user_priority: 0,
+            connection_kind: crate::api::model::ConnectionKind::Normal,
+            session_owner: Some("vod-session"),
+            playback_kind: crate::model::PlaybackKind::Vod,
+            accept_requested_stream_url: true,
+        },
+    )
+    .await;
+
+    let (ProviderStreamState::Available(Some(fallback_provider), url)
+    | ProviderStreamState::GracePeriod(Some(fallback_provider), url)) = fallback.provider_stream_state
+    else {
+        panic!("fallback-enabled request should allocate fallback provider")
+    };
+    assert_eq!(fallback_provider.as_ref(), "provider_2");
+    assert_eq!(url.as_ref(), "http://provider-2.example/movie/user2/pass2/1.mkv");
+
+    app_state.active_provider.release_connection(&busy_addr);
+    app_state.active_provider.release_connection(&fallback_addr);
+}
+
+#[tokio::test]
+async fn create_stream_response_details_preserves_stored_headers_when_fallback_open_fails() {
+    let app_state = create_test_dual_provider_app_state();
+    let input_name = "provider_1".intern();
+    let input =
+        app_state.app_config.sources.load().get_input_by_name(&input_name).cloned().unwrap_or_else(|| unreachable!());
+    let pinned_provider = "provider_1".intern();
+    let busy_addr: SocketAddr = "127.0.0.1:55306".parse().unwrap_or_else(|_| unreachable!());
+    let reacquire_addr: SocketAddr = "127.0.0.1:55307".parse().unwrap_or_else(|_| unreachable!());
+    let stream_url = "http://provider-1.example/movie/user1/pass1/1.mkv";
+
+    let user = load_test_user("test-fallback-headers-user");
+    let session_token = "sess-fallback-headers-1";
+    let initial_headers = HashMap::from([("cookie".to_string(), "old_prov_sess=1".to_string())]);
+    let created = app_state
+        .active_users
+        .create_user_session(crate::api::model::CreateUserSessionParams {
+            user: &user,
+            session_token,
+            virtual_id: 1,
+            provider: &pinned_provider,
+            stream_url,
+            addr: &reacquire_addr,
+            connection_permission: UserConnectionPermission::Allowed,
+            connection_kind: Some(crate::api::model::ConnectionKind::Normal),
+            socket_bound: false,
+        })
+        .await;
+    assert!(!created.is_empty());
+    app_state.active_users.update_session_provider_headers(&user.username, session_token, &initial_headers).await;
+
+    let busy = app_state.active_provider.acquire_exact_connection_with_grace(
+        &pinned_provider,
+        &busy_addr,
+        false,
+        0,
+        crate::api::model::ConnectionKind::Normal,
+    );
+    assert!(busy.is_some(), "setup should occupy the pinned provider");
+
+    let channel = create_test_live_channel(stream_url);
+    let details = create_stream_response_details(
+        &app_state,
+        &get_stream_options(&app_state.app_config),
+        stream_url,
+        &user.username,
+        &create_test_fingerprint(reacquire_addr),
+        &HeaderMap::new(),
+        &input,
+        &channel,
+        PlaylistItemType::Video,
+        crate::api::model::ProviderContentRepresentationMode::Identity,
+        false,
+        UserConnectionPermission::Allowed,
+        Some(&pinned_provider),
+        true,
+        false,
+        VirtualId::new(channel.virtual_id),
+        0,
+        crate::api::model::ConnectionKind::Normal,
+        true,
+        Some(session_token),
+        Some(&initial_headers),
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("create_stream_response_details should succeed: {err}"));
+
+    assert_eq!(details.provider_name.as_deref(), Some("provider_2"));
+    assert!(details.session_headers.is_none(), "fallback request should not pass pinned provider session headers");
+    assert!(details.stream.is_none(), "test setup should fail to open the fallback provider stream");
+
+    let session = app_state
+        .active_users
+        .get_and_update_user_session(&user.username, session_token)
+        .await
+        .expect("session should exist");
+    assert_eq!(
+        session.provider_session_headers, initial_headers,
+        "stored session headers should be retained when the fallback provider cannot be opened"
+    );
+
+    app_state.active_provider.release_connection(&busy_addr);
+    app_state.active_provider.release_connection(&reacquire_addr);
+}
+
+#[tokio::test]
+async fn force_provider_stream_response_clears_stored_headers_after_fallback_open_succeeds() {
+    const FALLBACK_BODY: &[u8] = b"fallback-provider";
+    let response_head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        FALLBACK_BODY.len()
+    );
+    let (origin_addr, origin_task) = spawn_legacy_hls_test_origin(response_head, FALLBACK_BODY.to_vec()).await;
+    let app_config = create_test_dual_provider_app_config();
+    let Some(configured_input) = app_config.sources.load().inputs.first().cloned() else { unreachable!() };
+    let mut fallback_input = (*configured_input).clone();
+    let Some(aliases) = fallback_input.aliases.as_mut() else { unreachable!() };
+    let Some(fallback_alias) = aliases.first_mut() else { unreachable!() };
+    fallback_alias.url = format!("http://{origin_addr}");
+    app_config
+        .sources
+        .store(Arc::new(SourcesConfig { inputs: vec![Arc::new(fallback_input)], ..SourcesConfig::default() }));
+    let app_state = create_test_app_state_for_config(Arc::new(app_config));
+    let input_name = "provider_1".intern();
+    let input =
+        app_state.app_config.sources.load().get_input_by_name(&input_name).cloned().unwrap_or_else(|| unreachable!());
+    let pinned_provider = "provider_1".intern();
+    let busy_addr: SocketAddr = "127.0.0.1:55308".parse().unwrap_or_else(|_| unreachable!());
+    let reacquire_addr: SocketAddr = "127.0.0.1:55309".parse().unwrap_or_else(|_| unreachable!());
+    let stream_url = "http://provider-1.example/movie/user1/pass1/1.mkv";
+
+    let user = load_test_user("test-fallback-force-user");
+    let session_token = "sess-fallback-force-1";
+    let initial_headers = HashMap::from([("cookie".to_string(), "old_pinned_token=abc".to_string())]);
+    let created = app_state
+        .active_users
+        .create_user_session(crate::api::model::CreateUserSessionParams {
+            user: &user,
+            session_token,
+            virtual_id: 1,
+            provider: &pinned_provider,
+            stream_url,
+            addr: &reacquire_addr,
+            connection_permission: UserConnectionPermission::Allowed,
+            connection_kind: Some(crate::api::model::ConnectionKind::Normal),
+            socket_bound: false,
+        })
+        .await;
+    assert!(!created.is_empty());
+    app_state.active_users.update_session_provider_headers(&user.username, session_token, &initial_headers).await;
+
+    let busy = app_state.active_provider.acquire_exact_connection_with_grace(
+        &pinned_provider,
+        &busy_addr,
+        false,
+        0,
+        crate::api::model::ConnectionKind::Normal,
+    );
+    assert!(busy.is_some(), "setup should occupy the pinned provider");
+
+    let session = app_state
+        .active_users
+        .get_and_update_user_session(&user.username, session_token)
+        .await
+        .expect("session should exist");
+
+    let channel = create_test_live_channel(stream_url);
+    let response = force_provider_stream_response(
+        &create_test_fingerprint(reacquire_addr),
+        &app_state,
+        &session,
+        channel,
+        ForceStreamRequestContext {
+            req_headers: &HeaderMap::new(),
+            input: &input,
+            user: &user,
+            session_reservation_ttl_secs: 0,
+            content_representation: crate::api::model::ProviderContentRepresentationMode::Identity,
+        },
+        None,
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.expect("fallback stream body").to_bytes();
+    assert_eq!(body.as_ref(), FALLBACK_BODY);
+    let request = tokio::time::timeout(std::time::Duration::from_secs(5), origin_task)
+        .await
+        .expect("fallback request was not sent within 5 seconds")
+        .expect("fallback origin task completes");
+    assert!(!request.is_empty(), "fallback provider must receive the stream request");
+
+    let updated_session = app_state
+        .active_users
+        .get_and_update_user_session(&user.username, session_token)
+        .await
+        .expect("session should exist");
+    assert!(
+        updated_session.provider_session_headers.is_empty(),
+        "stored session headers must be cleared after the fallback provider stream opens"
+    );
+
+    app_state.active_provider.release_connection(&busy_addr);
+}
+
+#[tokio::test]
 async fn resolve_streaming_strategy_rewrites_stale_alias_url_to_selected_main_provider() {
     let app_state = create_test_dual_provider_app_state();
     let input_name = "provider_1".intern();
@@ -4059,6 +4309,60 @@ async fn resolve_streaming_strategy_accepts_stalker_portal_url() {
 }
 
 #[tokio::test]
+async fn resolve_streaming_strategy_rejects_stalker_url_after_forced_provider_fallback() {
+    let app_config = create_test_dual_provider_app_config();
+    let Some(configured_input) = app_config.sources.load().inputs.first().cloned() else { unreachable!() };
+    let mut stalker_input = (*configured_input).clone();
+    stalker_input.input_type = InputType::Stalker;
+    app_config
+        .sources
+        .store(Arc::new(SourcesConfig { inputs: vec![Arc::new(stalker_input)], ..SourcesConfig::default() }));
+    let app_state = create_test_app_state_for_config(Arc::new(app_config));
+    let input_name = "provider_1".intern();
+    let input =
+        app_state.app_config.sources.load().get_input_by_name(&input_name).cloned().unwrap_or_else(|| unreachable!());
+    let pinned_provider = "provider_1".intern();
+    let busy_addr: SocketAddr = "127.0.0.1:55308".parse().unwrap_or_else(|_| unreachable!());
+    let fallback_addr: SocketAddr = "127.0.0.1:55309".parse().unwrap_or_else(|_| unreachable!());
+    let stream_url = "http://line.example/play/live.php?mac=00:11:22:33:44:55&stream=347&extension=ts&play_token=abc";
+
+    let busy = app_state.active_provider.acquire_exact_connection_with_grace(
+        &pinned_provider,
+        &busy_addr,
+        false,
+        0,
+        crate::api::model::ConnectionKind::Normal,
+    );
+    assert!(busy.is_some(), "setup should occupy the pinned provider");
+
+    let strategy = resolve_streaming_strategy(
+        &app_state,
+        stream_url,
+        &create_test_fingerprint(fallback_addr),
+        &input,
+        StreamingAcquireOptions {
+            force_provider: Some(&pinned_provider),
+            allow_forced_provider_fallback: true,
+            allow_provider_grace: false,
+            user_priority: 0,
+            connection_kind: crate::api::model::ConnectionKind::Normal,
+            session_owner: Some("live-session"),
+            playback_kind: crate::model::PlaybackKind::LiveTs,
+            accept_requested_stream_url: false,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        strategy.provider_stream_state,
+        ProviderStreamState::Custom { reason: ProviderStreamCustomReason::UnmappedProviderUrl, .. }
+    ));
+
+    app_state.active_provider.release_connection(&busy_addr);
+    app_state.active_provider.release_connection(&fallback_addr);
+}
+
+#[tokio::test]
 async fn resolve_streaming_strategy_accepts_session_requested_stream_url() {
     let app_state = create_test_dual_provider_app_state();
     let input_name = "provider_1".intern();
@@ -4103,6 +4407,7 @@ fn test_should_allow_exhausted_shared_reconnect_only_for_matching_shared_session
         provider: Arc::<str>::from("provider"),
         stream_url: Arc::<str>::from("http://provider/live/449924.ts"),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         user_agent_stream_index: None,
         addr: "127.0.0.1:1234".parse().unwrap_or_else(|_| unreachable!()),
         socket_bound: false,
@@ -4310,6 +4615,8 @@ fn create_test_app_state_for_config(app_cfg: Arc<AppConfig>) -> Arc<AppState> {
         http_client: Arc::new(ArcSwap::from_pointee(reqwest::Client::new())),
         http_client_no_redirect: Arc::new(ArcSwap::from_pointee(reqwest::Client::new())),
         public_http_client_no_redirect: Arc::new(ArcSwap::from_pointee(reqwest::Client::new())),
+        resource_http_client_no_redirect: Arc::new(ArcSwap::from_pointee(reqwest::Client::new())),
+        resource_public_http_client_no_redirect: Arc::new(ArcSwap::from_pointee(reqwest::Client::new())),
         downloads: Arc::new(crate::api::model::DownloadQueue::new()),
         cache: Arc::new(ArcSwapOption::default()),
         shared_stream_manager,
@@ -4341,7 +4648,7 @@ fn create_test_fingerprint(addr: std::net::SocketAddr) -> Fingerprint {
 }
 
 #[tokio::test]
-async fn resource_cache_is_used_only_by_matching_standard_fetch_policy() {
+async fn resource_cache_is_used_only_by_matching_public_fetch_policy() {
     const CACHED_BODY: &[u8] = b"cached image";
     const UPSTREAM_BODY: &[u8] = b"upstream image";
 
@@ -4361,21 +4668,24 @@ async fn resource_cache_is_used_only_by_matching_standard_fetch_policy() {
     );
     let (upstream_addr, upstream_task) = spawn_legacy_hls_test_origin(response_head, UPSTREAM_BODY.to_vec()).await;
     let proxy = reqwest::Proxy::http(format!("http://{upstream_addr}")).expect("mock proxy URL");
-    let mock_client = reqwest::Client::builder().proxy(proxy).build().expect("mock upstream client");
-    app_state.public_http_client_no_redirect.store(Arc::new(mock_client));
+    let mock_client = Arc::new(reqwest::Client::builder().proxy(proxy).build().expect("mock upstream client"));
+    // The destination is public, so the hop is fetched through the public resource client; both resource
+    // clients are mocked so the assertion below is about the cache, not about which client performed the
+    // request.
+    app_state.resource_public_http_client_no_redirect.store(Arc::clone(&mock_client));
+    app_state.resource_http_client_no_redirect.store(mock_client);
 
-    let standard_response =
-        resource_response(&app_state, ResourceFetchPolicy::Standard, resource_url, &HeaderMap::new(), None)
+    let public_response =
+        resource_response(&app_state, ResourceFetchPolicy::Public, resource_url, &HeaderMap::new(), None)
             .await
             .into_response();
-    assert_eq!(standard_response.status(), StatusCode::OK);
-    let standard_body = standard_response.into_body().collect().await.expect("read cached image").to_bytes();
-    assert_eq!(standard_body, Bytes::from_static(CACHED_BODY));
+    assert_eq!(public_response.status(), StatusCode::OK);
+    let public_body = public_response.into_body().collect().await.expect("read cached image").to_bytes();
+    assert_eq!(public_body, Bytes::from_static(CACHED_BODY));
 
-    let response =
-        resource_response(&app_state, ResourceFetchPolicy::PublicNoRedirect, resource_url, &HeaderMap::new(), None)
-            .await
-            .into_response();
+    let response = resource_response(&app_state, ResourceFetchPolicy::NonPublic, resource_url, &HeaderMap::new(), None)
+        .await
+        .into_response();
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_body = response.into_body().collect().await.expect("read upstream image").to_bytes();
@@ -4387,12 +4697,413 @@ async fn resource_cache_is_used_only_by_matching_standard_fetch_policy() {
 }
 
 #[tokio::test]
-async fn public_resource_destination_validation_rejects_loopback_url() {
-    let url = Url::parse("http://127.0.0.1/icon.png").expect("loopback URL");
+async fn no_redirect_resource_ignores_configured_proxy() {
+    let app_state = create_test_app_state();
+    let response_head =
+        "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.2/other.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (proxy_addr, proxy_task) = spawn_legacy_hls_test_origin(response_head.to_string(), Vec::new()).await;
+    app_state.app_config.config.store(Arc::new(Config {
+        proxy: Some(crate::model::ProxyConfig { url: format!("http://{proxy_addr}"), username: None, password: None }),
+        ..Config::default()
+    }));
+    let client = crate::api::model::create_resource_http_client_no_redirect(&app_state.app_config)
+        .expect("resource HTTP client");
+    // 192.0.2.1 (TEST-NET-1) is not routable, so a direct attempt fails by timing out or refusing the
+    // connection. A response would mean the request was answered by the proxy after all.
+    let result = client.get("http://192.0.2.1/icon.png").timeout(std::time::Duration::from_millis(100)).send().await;
+    assert!(
+        result.as_ref().is_err_and(|err| err.is_timeout() || err.is_connect()),
+        "the direct path must be attempted: {result:?}"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), proxy_task).await.is_err(),
+        "resource client must not send requests through the configured proxy"
+    );
+}
 
-    let result = validate_public_resource_destination(&url).await;
+#[tokio::test]
+async fn public_resource_client_honours_the_configured_proxy() {
+    // Counterpart of `no_redirect_resource_ignores_configured_proxy`: a resource hop that can leave the
+    // local network must go through the configured proxy, or the fetch discloses this host's address.
+    let app_state = create_test_app_state();
+    let response_head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\n";
+    let (proxy_addr, proxy_task) = spawn_legacy_hls_test_origin(response_head.to_string(), b"png".to_vec()).await;
+    app_state.app_config.config.store(Arc::new(Config {
+        proxy: Some(crate::model::ProxyConfig { url: format!("http://{proxy_addr}"), username: None, password: None }),
+        ..Config::default()
+    }));
+    let client = crate::api::model::create_resource_public_http_client_no_redirect(&app_state.app_config)
+        .expect("resource HTTP client");
 
-    assert!(result.is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied));
+    let response = client.get("http://8.8.8.8/icon.png").send().await.expect("request reaches the proxy");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = tokio::time::timeout(std::time::Duration::from_secs(2), proxy_task)
+        .await
+        .expect("request must reach proxy")
+        .expect("proxy task");
+    assert!(request.starts_with("GET http://8.8.8.8/icon.png HTTP/1.1\r\n"), "{request}");
+}
+
+#[tokio::test]
+async fn an_unresolved_resource_name_is_fetched_through_the_configured_proxy() {
+    // A resource name that does not resolve locally is still resolvable through a configured proxy (for
+    // example with remote DNS), so the fetch must not be pinned to the direct client.
+    let app_state = create_test_app_state();
+    let response_head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\n";
+    let (proxy_addr, proxy_task) = spawn_legacy_hls_test_origin(response_head.to_string(), b"png".to_vec()).await;
+    app_state.app_config.config.store(Arc::new(Config {
+        proxy: Some(crate::model::ProxyConfig { url: format!("http://{proxy_addr}"), username: None, password: None }),
+        ..Config::default()
+    }));
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).expect("test proxy"))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mock proxy client");
+    app_state.resource_public_http_client_no_redirect.store(Arc::new(client));
+
+    let response =
+        resource_proxy_response(&app_state, "http://unresolved.invalid/logo.png", &HeaderMap::new(), None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().collect().await.expect("image body").to_bytes(), Bytes::from_static(b"png"));
+    let request = tokio::time::timeout(std::time::Duration::from_secs(2), proxy_task)
+        .await
+        .expect("request must reach proxy")
+        .expect("proxy task");
+    assert!(request.starts_with("GET http://unresolved.invalid/logo.png HTTP/1.1\r\n"), "{request}");
+}
+
+#[tokio::test]
+async fn public_resource_client_reaches_a_proxy_on_loopback() {
+    // A proxy is commonly configured on the loopback interface (`http://localhost:8118`), so the
+    // connect-time guard of the public resource client must not reject the proxy host itself.
+    let app_state = create_test_app_state();
+    let response_head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\n";
+    let (proxy_addr, proxy_task) = spawn_legacy_hls_test_origin(response_head.to_string(), b"png".to_vec()).await;
+    app_state.app_config.config.store(Arc::new(Config {
+        proxy: Some(crate::model::ProxyConfig {
+            url: format!("http://localhost:{}", proxy_addr.port()),
+            username: None,
+            password: None,
+        }),
+        ..Config::default()
+    }));
+    let client = crate::api::model::create_resource_public_http_client_no_redirect(&app_state.app_config)
+        .expect("resource HTTP client");
+
+    let response = client.get("http://8.8.8.8/icon.png").send().await.expect("request reaches the proxy");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = tokio::time::timeout(std::time::Duration::from_secs(2), proxy_task)
+        .await
+        .expect("request must reach proxy")
+        .expect("proxy task");
+    assert!(request.starts_with("GET http://8.8.8.8/icon.png HTTP/1.1\r\n"), "{request}");
+}
+
+#[tokio::test]
+async fn no_redirect_resource_refuses_destinations_local_to_this_host() {
+    let app_state = create_test_app_state();
+    let (proxy_addr, proxy_task) =
+        spawn_legacy_hls_test_origin("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(), Vec::new()).await;
+    app_state.app_config.config.store(Arc::new(Config {
+        proxy: Some(crate::model::ProxyConfig { url: format!("http://{proxy_addr}"), username: None, password: None }),
+        ..Config::default()
+    }));
+    let client = crate::api::model::create_resource_http_client_no_redirect(&app_state.app_config)
+        .expect("resource HTTP client");
+    app_state.resource_http_client_no_redirect.store(Arc::new(client));
+
+    for local_only in ["http://127.0.0.1/icon.png", "http://169.254.169.254/latest/meta-data/", "http://[::1]/icon.png"]
+    {
+        let response =
+            resource_response(&app_state, ResourceFetchPolicy::NonPublic, local_only, &HeaderMap::new(), None)
+                .await
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{local_only}");
+    }
+
+    // The guard rejects before a request is built, so nothing may reach the configured proxy.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), proxy_task).await.is_err(),
+        "no request may reach the proxy for local-only destinations"
+    );
+}
+
+#[tokio::test]
+async fn resource_redirect_hides_private_destination_and_upstream_location() {
+    let app_state = create_test_app_state();
+    let response_head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nLocation: http://10.0.0.2/private\r\nContent-Length: 3\r\nConnection: close\r\n\r\n";
+    let (proxy_addr, proxy_task) = spawn_legacy_hls_test_origin(response_head.to_string(), b"png".to_vec()).await;
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).expect("test proxy"))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mock upstream client");
+    app_state.resource_http_client_no_redirect.store(Arc::new(client));
+
+    let private = resource_redirect_or_proxy(&app_state, "http://10.0.0.1/icon.png", &HeaderMap::new(), None).await;
+    assert_eq!(private.status(), StatusCode::OK);
+    assert!(private.headers().get("location").is_none());
+    assert_eq!(private.into_body().collect().await.expect("private icon body").to_bytes(), Bytes::from_static(b"png"));
+    let request = proxy_task.await.expect("mock request");
+    assert!(request.starts_with("GET http://10.0.0.1/icon.png HTTP/1.1\r\n"));
+
+    let public = resource_redirect_or_proxy(&app_state, "http://8.8.8.8/icon.png", &HeaderMap::new(), None).await;
+    assert_eq!(public.status(), StatusCode::FOUND);
+    assert_eq!(public.headers().get("location").and_then(|value| value.to_str().ok()), Some("http://8.8.8.8/icon.png"));
+
+    let local_thumbnail =
+        resource_redirect_or_proxy(&app_state, "/api/v1/library/thumbnail/item", &HeaderMap::new(), None).await;
+    assert_eq!(local_thumbnail.status(), StatusCode::FOUND);
+    assert_eq!(
+        local_thumbnail.headers().get("location").and_then(|value| value.to_str().ok()),
+        Some("/api/v1/library/thumbnail/item")
+    );
+
+    let blocked = resource_redirect_or_proxy(&app_state, "http://127.0.0.1/icon.png", &HeaderMap::new(), None).await;
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert!(blocked.headers().get("location").is_none());
+}
+
+#[tokio::test]
+async fn proxied_m3u_logo_follows_private_redirect_without_forwarding_credentials() {
+    let app_state = create_test_app_state();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock proxy binds");
+    let proxy_addr = listener.local_addr().expect("mock proxy address");
+    let proxy_task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in [
+            "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.2/icon.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\npng",
+        ] {
+            let (mut socket, _) = listener.accept().await.expect("mock proxy accepts request");
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("mock proxy reads request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket.write_all(response.as_bytes()).await.expect("mock proxy writes response");
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+        }
+        requests
+    });
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).expect("mock proxy URL"))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mock resource client");
+    app_state.resource_http_client_no_redirect.store(Arc::new(client));
+    let input = ConfigInput {
+        url: "http://10.0.0.1/playlist.m3u".to_string(),
+        headers: HashMap::from([("Authorization".to_string(), "Bearer secret".to_string())]),
+        ..ConfigInput::default()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer player-secret"));
+
+    let response = resource_proxy_response(&app_state, "http://10.0.0.1/logo.png", &headers, Some(&input)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().collect().await.expect("image body").to_bytes(), Bytes::from_static(b"png"));
+
+    let requests = proxy_task.await.expect("mock proxy task");
+    assert!(requests[0].starts_with("GET http://10.0.0.1/logo.png HTTP/1.1\r\n"));
+    assert!(requests[0].to_ascii_lowercase().contains("authorization: bearer secret"));
+    assert!(!requests[0].contains("player-secret"));
+    assert!(requests[1].starts_with("GET http://10.0.0.2/icon.png HTTP/1.1\r\n"));
+    assert!(!requests[1].to_ascii_lowercase().contains("authorization:"));
+}
+
+#[test]
+fn configured_resource_headers_are_limited_to_the_input_origin() {
+    let input = ConfigInput { url: "http://10.0.0.1:8080/playlist.m3u".to_string(), ..ConfigInput::default() };
+    assert!(resource_input_for_url(Some(&input), "http://10.0.0.1:8080/logo.png").is_some());
+    assert!(resource_input_for_url(Some(&input), "http://10.0.0.2:8080/logo.png").is_none());
+    assert!(resource_input_for_url(Some(&input), "http://10.0.0.1:8081/logo.png").is_none());
+    assert!(resource_input_for_url(Some(&input), "https://10.0.0.1:8080/logo.png").is_none());
+}
+
+#[tokio::test]
+async fn public_resource_is_fetched_through_the_configured_proxy() {
+    // Regression lock: a resource fetch that leaves the local network must use the configured proxy,
+    // otherwise it discloses the operator's address to the resource host. The Web UI resource route
+    // reaches this path, because it wraps every icon of a public destination into a proxy link.
+    let app_state = create_test_app_state();
+    let response_head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\n";
+    let (proxy_addr, proxy_task) = spawn_legacy_hls_test_origin(response_head.to_string(), b"png".to_vec()).await;
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).expect("test proxy"))
+        .build()
+        .expect("mock proxy client");
+    app_state.resource_public_http_client_no_redirect.store(Arc::new(client));
+
+    let response = resource_proxy_response(&app_state, "http://8.8.8.8/logo.png", &HeaderMap::new(), None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().collect().await.expect("image body").to_bytes(), Bytes::from_static(b"png"));
+    let request = tokio::time::timeout(std::time::Duration::from_secs(2), proxy_task)
+        .await
+        .expect("request must reach proxy")
+        .expect("proxy task");
+    assert!(request.starts_with("GET http://8.8.8.8/logo.png HTTP/1.1\r\n"), "{request}");
+}
+
+#[tokio::test]
+async fn proxied_resource_follows_a_redirect_into_the_public_network_through_the_configured_proxy() {
+    // Regression lock: the hop decides which client is used. A network-internal destination that
+    // redirects to a public host must not make the follow-up request directly, or the redirect would
+    // disclose the operator's address to that host despite a configured proxy.
+    let app_state = create_test_app_state();
+    let redirect_head =
+        "HTTP/1.1 302 Found\r\nLocation: http://8.8.8.8/logo.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (private_proxy_addr, private_proxy_task) =
+        spawn_legacy_hls_test_origin(redirect_head.to_string(), Vec::new()).await;
+    let private_client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{private_proxy_addr}")).expect("test proxy"))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mock private client");
+    app_state.resource_http_client_no_redirect.store(Arc::new(private_client));
+
+    let response_head = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\n";
+    let (public_proxy_addr, public_proxy_task) =
+        spawn_legacy_hls_test_origin(response_head.to_string(), b"png".to_vec()).await;
+    let public_client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{public_proxy_addr}")).expect("test proxy"))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mock public client");
+    app_state.resource_public_http_client_no_redirect.store(Arc::new(public_client));
+
+    let response = resource_proxy_response(&app_state, "http://10.0.0.1/logo.png", &HeaderMap::new(), None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().collect().await.expect("image body").to_bytes(), Bytes::from_static(b"png"));
+    let first_hop = private_proxy_task.await.expect("first hop request");
+    assert!(first_hop.starts_with("GET http://10.0.0.1/logo.png HTTP/1.1\r\n"), "{first_hop}");
+    let second_hop = tokio::time::timeout(std::time::Duration::from_secs(2), public_proxy_task)
+        .await
+        .expect("public hop must be fetched")
+        .expect("public hop request");
+    assert!(second_hop.starts_with("GET http://8.8.8.8/logo.png HTTP/1.1\r\n"), "{second_hop}");
+}
+
+#[tokio::test]
+async fn public_resource_redirect_to_a_destination_local_to_this_host_is_refused() {
+    // Regression lock: a public host that redirects to loopback, link-local, or a cloud metadata
+    // endpoint must not turn the resource route into a reader for this host. The redirect target is
+    // never requested, and its location is never relayed to the client.
+    let app_state = create_test_app_state();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock proxy binds");
+    let proxy_addr = listener.local_addr().expect("mock proxy address");
+    let proxy_task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        loop {
+            let Ok(accepted) = tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            else {
+                break;
+            };
+            let Ok((mut socket, _)) = accepted else { break };
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            requests.push(String::from_utf8_lossy(&request).into_owned());
+            let head = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(head.as_bytes()).await;
+        }
+        requests
+    });
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).expect("test proxy"))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mock client");
+    app_state.resource_public_http_client_no_redirect.store(Arc::new(client));
+
+    let response = resource_proxy_response(&app_state, "http://8.8.8.8/logo.png", &HeaderMap::new(), None).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get("location").is_none(), "the local destination must not be relayed");
+    let requests = proxy_task.await.expect("mock proxy task");
+    assert_eq!(requests.len(), 1, "the local destination must not be requested: {requests:?}");
+}
+
+#[tokio::test]
+async fn no_redirect_resource_does_not_relay_upstream_error_details() {
+    let app_state = create_test_app_state();
+    let body = b"<html>internal service error</html>".to_vec();
+    let response_head =
+        format!("HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n", body.len());
+    let (proxy_addr, proxy_task) = spawn_legacy_hls_test_origin(response_head, body.clone()).await;
+    app_state.app_config.config.store(Arc::new(Config {
+        proxy: Some(crate::model::ProxyConfig { url: format!("http://{proxy_addr}"), username: None, password: None }),
+        ..Config::default()
+    }));
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).expect("test proxy"))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("mock upstream client");
+    app_state.resource_http_client_no_redirect.store(Arc::new(client));
+
+    let response = resource_response(
+        &app_state,
+        ResourceFetchPolicy::NonPublic,
+        "http://10.0.0.1/icon.png",
+        &HeaderMap::new(),
+        None,
+    )
+    .await
+    .into_response();
+
+    // The client learns that the fetch failed, not what the destination answered.
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let relayed = response.into_body().collect().await.expect("response body").to_bytes();
+    assert!(relayed.is_empty(), "upstream error body must not be relayed: {relayed:?}");
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(2), proxy_task)
+        .await
+        .expect("request must reach proxy")
+        .expect("proxy task");
+    assert!(request.starts_with("GET http://10.0.0.1/icon.png HTTP/1.1\r\n"), "{request}");
+}
+
+#[tokio::test]
+async fn resource_client_refuses_names_that_resolve_to_local_addresses() {
+    let app_state = create_test_app_state();
+    let (origin_addr, _origin_task) =
+        spawn_legacy_hls_test_origin("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(), Vec::new()).await;
+    let guarded = crate::api::model::create_resource_http_client_no_redirect(&app_state.app_config)
+        .expect("resource HTTP client");
+
+    // `localhost` resolves to loopback on the client's DNS layer, so the request must fail while the
+    // name is resolved and never reach the origin that is listening on that loopback address.
+    let error = guarded
+        .get(format!("http://localhost:{}/icon.png", origin_addr.port()))
+        .send()
+        .await
+        .expect_err("a name resolving to a local address must be refused");
+
+    // reqwest only reports the outer failure, so the cause chain has to be walked to see the refusal.
+    let mut causes = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        causes.push_str(&format!(" | {cause}"));
+        source = cause.source();
+    }
+    assert!(causes.contains("local to this host"), "{causes}");
 }
 
 fn create_test_fingerprint_with_user_agent(addr: std::net::SocketAddr, user_agent: &str) -> Fingerprint {
@@ -4480,6 +5191,7 @@ fn create_test_session(
             _ => "http://provider-1.example/live/42.ts",
         }),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         user_agent_stream_index: None,
         addr: "127.0.0.1:55555".parse().unwrap_or_else(|_| unreachable!()),
         socket_bound: item_type.uses_socket_bound_session(),
@@ -4715,6 +5427,7 @@ async fn activate_session_before_stream_open_skips_placeholder_for_follow_up_ses
             stream_url: channel.url.as_ref(),
             connection_permission: UserConnectionPermission::Allowed,
             connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: None,
             socket_bound: true,
         },
     )
@@ -4786,6 +5499,7 @@ async fn activate_session_before_stream_open_revalidates_precomputed_follow_up_r
             stream_url: channel.url.as_ref(),
             connection_permission: UserConnectionPermission::Allowed,
             connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: None,
             socket_bound: true,
         },
     )
@@ -4867,6 +5581,7 @@ async fn activate_session_before_stream_open_stale_follow_up_reclassified_on_cou
             stream_url: channel.url.as_ref(),
             connection_permission: UserConnectionPermission::Allowed,
             connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: None,
             socket_bound: true,
         },
     )
@@ -4909,23 +5624,7 @@ async fn activate_session_before_stream_open_pre_resolved_grace_period_materiali
     channel.item_type = PlaylistItemType::LiveHls;
     channel.virtual_id = 55231;
 
-    // Session in Prepared state (no grace lifecycle yet).
-    app_state
-        .active_users
-        .create_user_session(crate::api::model::CreateUserSessionParams {
-            user: &user,
-            session_token: "tok-pre-resolved-grace",
-            virtual_id: channel.virtual_id,
-            provider: input.name.as_ref(),
-            stream_url: channel.url.as_ref(),
-            addr: &addr,
-            connection_permission: UserConnectionPermission::Allowed,
-            connection_kind: Some(crate::api::model::ConnectionKind::Normal),
-            socket_bound: true,
-        })
-        .await;
-
-    // Call activation with pre-resolved GracePeriod permission.
+    // A pre-resolved grace grant reaches activation before a session exists.
     let activation = activate_session_before_stream_open(
         &app_state,
         SessionActivationRequest {
@@ -4939,6 +5638,7 @@ async fn activate_session_before_stream_open_pre_resolved_grace_period_materiali
             stream_url: channel.url.as_ref(),
             connection_permission: UserConnectionPermission::GracePeriod,
             connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: Some(crate::api::model::GraceMode::Hold),
             socket_bound: true,
         },
     )
@@ -4952,6 +5652,42 @@ async fn activate_session_before_stream_open_pre_resolved_grace_period_materiali
         session.is_some_and(|s| matches!(s.lifecycle, crate::api::model::PlaybackLifecycle::PendingProvider { .. })),
         "pre-resolved GracePeriod must materialize as PendingProvider lifecycle"
     );
+}
+
+#[tokio::test]
+async fn pre_resolved_instant_grace_creates_counted_live_session() {
+    let app_state = create_test_app_state();
+    let addr: SocketAddr = "127.0.0.1:55233".parse().unwrap_or_else(|_| unreachable!());
+    let fingerprint = create_test_fingerprint(addr);
+    let input = app_state.app_config.sources.load().inputs[0].clone();
+    let mut user = ProxyUserCredentials::default();
+    user.username = "instant-grace-live-user".to_string();
+    user.max_connections = 1;
+    let channel = create_test_live_channel("http://provider-1.example/live/55233.ts");
+
+    let activation = activate_session_before_stream_open(
+        &app_state,
+        SessionActivationRequest {
+            fingerprint: &fingerprint,
+            input: input.as_ref(),
+            user: &user,
+            session_token: "tok-instant-grace",
+            request_class: Some(PlaybackRequestClass::Activate),
+            virtual_id: VirtualId::new(channel.virtual_id),
+            item_type: PlaylistItemType::Live,
+            stream_url: channel.url.as_ref(),
+            connection_permission: UserConnectionPermission::GracePeriod,
+            connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: Some(crate::api::model::GraceMode::Instant),
+            socket_bound: true,
+        },
+    )
+    .await;
+
+    assert_eq!(activation.grace_mode, Some(crate::api::model::GraceMode::Instant));
+    assert_eq!(app_state.active_users.user_connections(&user.username).await, 1);
+    let session = app_state.active_users.get_and_update_user_session(&user.username, "tok-instant-grace").await;
+    assert!(session.is_some_and(|session| session.lifecycle == crate::api::model::PlaybackLifecycle::GraceActive));
 }
 
 /// `activate_session_before_stream_open` skips placeholder for Prepare class.
@@ -4995,6 +5731,7 @@ async fn activate_session_before_stream_open_skips_placeholder_for_prepare() {
             stream_url: "http://provider.example/live/test.ts",
             connection_permission: UserConnectionPermission::Allowed,
             connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: None,
             socket_bound: true,
         },
     )
@@ -5218,6 +5955,7 @@ async fn activate_session_before_stream_open_marks_pending_provider_for_grace_ho
             stream_url: second_channel.url.as_ref(),
             connection_permission: UserConnectionPermission::Allowed,
             connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: None,
             socket_bound: false,
         },
     )
@@ -5302,6 +6040,7 @@ async fn activate_session_before_stream_open_does_not_commit_user_lease_before_p
             stream_url: channel.url.as_ref(),
             connection_permission: UserConnectionPermission::Allowed,
             connection_kind: crate::api::model::ConnectionKind::Normal,
+            granted_grace_mode: None,
             socket_bound: false,
         },
     )
@@ -5329,6 +6068,7 @@ async fn activate_session_before_stream_open_does_not_commit_user_lease_before_p
 
 fn create_test_shared_target() -> ConfigTarget {
     ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "shared".to_string(),
@@ -5522,7 +6262,7 @@ async fn grace_context_is_populated_when_grace_strategy_is_actually_granted() {
 async fn evaluate_remaining_strategies_evicts_after_used_grace() {
     // Strategies: [GraceHoldStream, EvictUserOldest]
     // Grace was used at index 0, so only EvictUserOldest (index 1) is evaluated.
-    // Eviction frees the slot -> Allowed.
+    // The new request stays retryable while the evicted stream still owns its provider slot.
     let strategies = vec![AdmissionStrategy::GraceHoldStream, AdmissionStrategy::EvictUserOldest];
     let grace_context = GraceResolutionContext { strategy_index: 0, strategies: strategies.into(), kind: None };
 
@@ -5543,6 +6283,9 @@ async fn evaluate_remaining_strategies_evicts_after_used_grace() {
         recent_eviction_reentry_ttl: std::time::Duration::from_millis(1500),
         admission_strategies: Some(vec![AdmissionStrategy::GraceHoldStream, AdmissionStrategy::EvictUserOldest]),
     });
+    let provider_config = create_test_provider_app_config();
+    app_state.app_config.sources.store(provider_config.sources.load_full());
+    app_state.active_provider.update_config(&app_state.app_config);
 
     let addr1: SocketAddr = "127.0.0.1:55701".parse().unwrap_or_else(|_| unreachable!());
     let addr2: SocketAddr = "10.0.0.5:55702".parse().unwrap_or_else(|_| unreachable!());
@@ -5591,23 +6334,71 @@ async fn evaluate_remaining_strategies_evicts_after_used_grace() {
         .await
         .expect("stream should be created");
 
-    let result = evaluate_remaining_strategies_after_grace(
-        &app_state.admission_ctx(),
-        AdmissionRequest {
-            username: "remaining-evict",
-            max_connections: 1,
-            soft_connections: 0,
-            client_ip: &fingerprint2.client_ip,
-            request_addr: &fingerprint2.addr,
-            use_session_admission: true,
-            session_token: Some("tok-new"),
-            activate_unbound_session: true,
-            eviction_reentry_guard: EvictionReentryGuard::Session("tok-new"),
-        },
-        &grace_context,
-        Some(crate::api::model::ConnectionKind::Normal),
+    let provider_handle = app_state
+        .active_provider
+        .acquire_connection_with_grace_for_session(
+            &"provider_1".intern(),
+            &addr1,
+            false,
+            0,
+            crate::api::model::ConnectionKind::Normal,
+            Some("tok-counted"),
+        )
+        .expect("old stream should occupy the only provider slot");
+    assert!(app_state.active_provider.register_body_owner(provider_handle.allocation_id));
+    let close_rx = app_state.connection_manager.register_close_socket(addr1);
+    let manager = Arc::clone(&app_state.connection_manager);
+    let provider = Arc::clone(&app_state.active_provider);
+    let release_body = Arc::new(tokio::sync::Notify::new());
+    let release_body_after_timeout = Arc::clone(&release_body);
+    let close_task = tokio::spawn(async move {
+        assert_eq!(close_rx.await.expect("kick close signal"), shared::model::DisconnectReason::ClientKicked);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        manager.release_provider_deferred(&addr1).await;
+        assert_eq!(provider.get_provider_connections_count(), 1, "body owner still holds provider capacity");
+        release_body_after_timeout.notified().await;
+        provider.release_handle(&provider_handle);
+        provider_handle.completion_token.as_ref().expect("body completion token").cancel();
+        manager.unregister_close_socket(&addr1);
+    });
+
+    let request = || AdmissionRequest {
+        username: "remaining-evict",
+        max_connections: 1,
+        soft_connections: 0,
+        client_ip: &fingerprint2.client_ip,
+        request_addr: &fingerprint2.addr,
+        use_session_admission: true,
+        session_token: Some("tok-new"),
+        activate_unbound_session: true,
+        eviction_reentry_guard: EvictionReentryGuard::Session("tok-new"),
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        evaluate_remaining_strategies_after_grace(
+            &app_state.admission_ctx(),
+            request(),
+            &grace_context,
+            Some(crate::api::model::ConnectionKind::Normal),
+        ),
     )
-    .await;
+    .await
+    .expect("admission must remain retryable while the provider slot is held");
+
+    assert_eq!(result.admission.permission(), UserConnectionPermission::Exhausted);
+    assert_eq!(app_state.active_provider.get_provider_connections_count(), 1);
+
+    let retry = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        resolve_admission_with_strategies(&app_state.admission_ctx(), request()),
+    )
+    .await
+    .expect("retry must remain bounded while the provider slot is held");
+    assert_eq!(retry.admission.permission(), UserConnectionPermission::Exhausted);
+
+    release_body.notify_one();
+    close_task.await.expect("old transport cleanup");
+    let result = resolve_admission_with_strategies(&app_state.admission_ctx(), request()).await;
 
     assert_eq!(
         result.admission.permission(),
@@ -5615,6 +6406,23 @@ async fn evaluate_remaining_strategies_evicts_after_used_grace() {
         "EvictUserOldest should free the slot"
     );
     assert!(result.grace_context.is_none(), "no grace context on eviction success");
+    assert_eq!(
+        app_state.active_provider.get_provider_connections_count(),
+        0,
+        "admission must not return while the evicted stream still owns the provider slot"
+    );
+    let replacement = app_state.active_provider.acquire_connection_with_grace_for_session(
+        &"provider_1".intern(),
+        &addr2,
+        false,
+        0,
+        crate::api::model::ConnectionKind::Normal,
+        Some("tok-new"),
+    );
+    assert!(replacement.is_some(), "newly admitted stream must acquire the freed provider slot");
+    if let Some(replacement) = replacement {
+        app_state.active_provider.release_handle(&replacement);
+    }
 }
 
 #[tokio::test]
@@ -6866,6 +7674,7 @@ async fn local_stream_response_registers_active_local_stream() {
     let input = ConfigInput { input_type: InputType::Library, ..ConfigInput::default() };
     let user = ProxyUserCredentials::default();
     let target = ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "test".to_string(),
@@ -6925,6 +7734,7 @@ async fn local_stream_response_rechecks_limits_before_registering_socket_bound_s
     user.username = "local-limit-user".to_string();
     user.max_connections = 1;
     let target = ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "test".to_string(),
@@ -7250,6 +8060,7 @@ async fn stream_response_rolls_back_provisional_user_activation_when_provider_op
     let input_name = "provider_1".intern();
     let input = app_state.app_config.get_input_by_name(&input_name).expect("provider input should exist");
     let target = Arc::new(ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "test".to_string(),
@@ -7410,6 +8221,7 @@ async fn local_stream_response_disables_response_compression() {
     let input = ConfigInput { input_type: InputType::Library, ..ConfigInput::default() };
     let user = ProxyUserCredentials::default();
     let target = ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "test".to_string(),
@@ -7458,6 +8270,7 @@ async fn local_stream_response_reuses_stable_playback_session_token_across_reope
     let input = ConfigInput { input_type: InputType::Library, ..ConfigInput::default() };
     let user = ProxyUserCredentials::default();
     let target = ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "test".to_string(),
@@ -7532,6 +8345,7 @@ async fn local_stream_response_allows_exhausted_reopen_for_same_playback_session
     user.username = "user1".to_string();
     user.max_connections = 1;
     let target = ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "test".to_string(),
@@ -7609,6 +8423,7 @@ async fn local_stream_response_preserves_soft_kind_across_reopens() {
     user.max_connections = 1;
     user.soft_connections = 1;
     let target = ConfigTarget {
+        curation: None,
         id: 1,
         enabled: true,
         name: "test".to_string(),
@@ -8327,6 +9142,7 @@ fn session_reacquire_cleanup_addrs_excludes_current_and_deduplicates() {
         provider: "provider-a".intern(),
         stream_url: "http://localhost/movie.mkv".intern(),
         provider_session_headers: HashMap::new(),
+        media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         user_agent_stream_index: None,
         addr: seek,
         socket_bound: false,

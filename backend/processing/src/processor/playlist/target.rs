@@ -399,9 +399,113 @@ pub(crate) fn spill_epg_to_disk(sources: Vec<Epg>) -> Result<Option<Epg>, Tulipr
     }
 }
 
+fn finalization_step_label(view: &str, stage: &str) -> String {
+    if view.is_empty() {
+        stage.to_string()
+    } else {
+        format!("{view} {stage}")
+    }
+}
+
+pub(crate) fn prepare_eligible_catalog(
+    target: &ConfigTarget,
+    playlist: Vec<PlaylistGroup>,
+    step: &mut StepMeasure,
+) -> Vec<PlaylistGroup> {
+    let mut playlist = flatten_groups(playlist);
+    step.tick("playlist merge");
+    log_memory_snapshot(format!("target '{}' after_playlist_merge", target.name).as_str());
+    if let Some(dedup_config) = target.execution_plan.post_merge_content_dedup.as_ref() {
+        let removed = crate::processor::deduplicate::deduplicate_playlist(*dedup_config, &mut playlist);
+        if removed > 0 {
+            info!("Deduplicated {removed} eligible channels for target {}", target.name);
+        }
+        step.tick("playlist dedup");
+        log_memory_snapshot(format!("target '{}' after_playlist_dedup", target.name).as_str());
+    }
+    playlist
+}
+
+fn finalize_playlist_view(
+    target: &ConfigTarget,
+    playlist: Vec<PlaylistGroup>,
+    step: &mut StepMeasure,
+    view: &str,
+) -> Vec<PlaylistGroup> {
+    let mut playlist = flatten_groups(playlist);
+    step.tick(&finalization_step_label(view, "appearance merge"));
+
+    for stage in FINALIZATION_ORDER.into_iter().skip(2) {
+        match stage {
+            FinalizationStage::Merge | FinalizationStage::Deduplicate => {
+                unreachable!("eligibility merge and deduplication are completed before curation")
+            }
+            FinalizationStage::Sort => {
+                if sort_playlist(target, &mut playlist) {
+                    step.tick(&finalization_step_label(view, "playlist sort"));
+                    log_memory_snapshot(format!("target '{}' {view} after_playlist_sort", target.name).as_str());
+                }
+            }
+            FinalizationStage::AssignChannelNumbers => {
+                assign_channel_no_playlist(&mut playlist);
+                step.tick(&finalization_step_label(view, "assigning channel numbers"));
+                log_memory_snapshot(format!("target '{}' {view} after_assign_channel_numbers", target.name).as_str());
+            }
+            FinalizationStage::AssignCounters => {
+                map_playlist_counter(target, &mut playlist);
+                step.tick(&finalization_step_label(view, "assigning channel counter"));
+                log_memory_snapshot(format!("target '{}' {view} after_assign_channel_counter", target.name).as_str());
+            }
+        }
+    }
+
+    apply_persist_filter(target, &mut playlist);
+    playlist
+}
+
+// Keep construction and its diagnostic seam private to the processing boundary.
+// Only fixed phase labels can reach the reporter, never dependency error details.
+pub(super) fn build_target_tmdb_client(
+    target: &ConfigTarget,
+    configure: impl FnOnce() -> Result<reqwest::ClientBuilder, TuliproxError>,
+    report: impl FnOnce(&'static str),
+) -> Option<reqwest::Client> {
+    let needs_tmdb = target.curation.as_ref().is_some_and(|config| {
+        config.enabled && config.tmdb.as_ref().is_some_and(|source| source.enabled && !source.trending.is_empty())
+    });
+    if !needs_tmdb {
+        return None;
+    }
+    let Ok(builder) = configure() else {
+        report("phase=profile_configuration");
+        return None;
+    };
+    if let Ok(client) = builder.build() {
+        Some(client)
+    } else {
+        report("phase=client_build");
+        None
+    }
+}
 pub(crate) async fn finalize_prepared_target<E: EventSink + Clone + 'static, M: MetadataUpdateSink>(
     ctx: Arc<PlaylistProcessingContext<E, M>>,
     prepared: PreparedTarget,
+) -> (Result<(), Vec<TuliproxError>>, Vec<TuliproxError>) {
+    // No generic-client fallback: unavailable transport participates in the same admission gate.
+    let tmdb_client = build_target_tmdb_client(
+        &prepared.target,
+        || tuliprox_core::utils::network::request::create_tmdb_client(&ctx.config),
+        |phase| {
+            warn!("TMDB discovery client unavailable: target_id={} run_id={} {phase}", prepared.target.id, ctx.run_id);
+        },
+    );
+    finalize_prepared_target_with_tmdb(ctx, prepared, tmdb_client.as_ref()).await
+}
+
+pub(super) async fn finalize_prepared_target_with_tmdb<E: EventSink + Clone + 'static, M: MetadataUpdateSink>(
+    ctx: Arc<PlaylistProcessingContext<E, M>>,
+    prepared: PreparedTarget,
+    tmdb_client: Option<&reqwest::Client>,
 ) -> (Result<(), Vec<TuliproxError>>, Vec<TuliproxError>) {
     let target = &prepared.target;
     let mut new_playlist = prepared.playlist;
@@ -420,95 +524,83 @@ pub(crate) async fn finalize_prepared_target<E: EventSink + Clone + 'static, M: 
     {
         step.stop("");
         info!("Playlist is empty: {}", target.name);
-        (Ok(()), errors)
-    } else {
-        // Process Trakt categories
-        if trakt_playlist(&ctx.client, target, &mut new_playlist).await {
-            step.tick("trakt categories");
-            log_memory_snapshot(format!("target '{}' after_trakt", target.name).as_str());
-        }
-
-        let mut flat_new_playlist = flatten_groups(new_playlist);
-        step.tick("playlist merge");
-        log_memory_snapshot(format!("target '{}' after_playlist_merge", target.name).as_str());
-
-        for stage in FINALIZATION_ORDER.into_iter().skip(1) {
-            match stage {
-                FinalizationStage::Merge => unreachable!("merge is completed before post-merge finalization"),
-                FinalizationStage::Deduplicate => {
-                    if let Some(dedup_config) = target.execution_plan.post_merge_content_dedup.as_ref() {
-                        let removed =
-                            crate::processor::deduplicate::deduplicate_playlist(*dedup_config, &mut flat_new_playlist);
-                        if removed > 0 {
-                            info!("Deduplicated {removed} channels for target {}", target.name);
-                        }
-                        step.tick("playlist dedup");
-                        log_memory_snapshot(format!("target '{}' after_playlist_dedup", target.name).as_str());
-                    }
-                }
-                FinalizationStage::Sort => {
-                    if sort_playlist(target, &mut flat_new_playlist) {
-                        step.tick("playlist sort");
-                        log_memory_snapshot(format!("target '{}' after_playlist_sort", target.name).as_str());
-                    }
-                }
-                FinalizationStage::AssignChannelNumbers => {
-                    assign_channel_no_playlist(&mut flat_new_playlist);
-                    step.tick("assigning channel numbers");
-                    log_memory_snapshot(format!("target '{}' after_assign_channel_numbers", target.name).as_str());
-                }
-                FinalizationStage::AssignCounters => {
-                    map_playlist_counter(target, &mut flat_new_playlist);
-                    step.tick("assigning channel counter");
-                    log_memory_snapshot(format!("target '{}' after_assign_channel_counter", target.name).as_str());
-                }
-            }
-        }
-
-        apply_persist_filter(target, &mut flat_new_playlist);
-        retain_epg_referenced_by_groups(&flat_new_playlist, &mut new_epg);
-
-        let merged_epg = if ctx.config.config.load().disk_based_processing {
-            // Per-source drain to disk, then multi-way merge. Errors are pushed
-            // to `errors` rather than `?` because the function returns
-            // `(Result, Vec<TuliproxError>)`, not `Result` directly. We must
-            // surface tempdir / write / merge failures — the user opted in to
-            // disk spilling, and silently falling back to the in-memory path
-            // can OOM on large feeds. When the spill itself fails we skip the
-            // persist step entirely: continuing with `merged_epg = None` would
-            // overwrite the existing on-disk EPG with nothing and discard the
-            // previously persisted artifact on a transient error.
-            match spill_epg_to_disk(new_epg) {
-                Ok(epg) => epg,
-                Err(err) => {
-                    let result_error = TuliproxError::new(err.kind(), err.message());
-                    errors.push(err);
-                    step.stop("EPG spill failed; skipping persist to preserve existing EPG");
-                    log_memory_snapshot(format!("target '{}' after_persist", target.name).as_str());
-                    return (Err(vec![result_error]), errors);
-                }
-            }
-        } else {
-            flatten_tvguide(new_epg)
-        };
-        let library_empty = library_empty.for_filtered_playlist(&flat_new_playlist);
-        let result = persist_playlist(
-            &ctx.config,
-            &mut flat_new_playlist,
-            merged_epg.as_ref(),
-            target,
-            ctx.playlist_state.as_ref(),
-            TargetPlaylistPersistOptions { accepted_empty_clusters: prepared.accepted_empty_clusters, library_empty },
-        )
-        .await;
-        if result.is_ok() && process_watch(&ctx.config, &ctx.events, target, &flat_new_playlist).await {
-            step.tick("group watches");
-            log_memory_snapshot(format!("target '{}' after_group_watches", target.name).as_str());
-        }
-        step.stop("Persisting playlists");
-        log_memory_snapshot(format!("target '{}' after_persist", target.name).as_str());
-        (result, errors)
+        return (Ok(()), errors);
     }
+
+    let eligible_catalog = prepare_eligible_catalog(target, new_playlist, &mut step);
+    let views = match prepare_target_playlist_views(&ctx.client, tmdb_client, target, eligible_catalog).await {
+        Ok(views) => views,
+        Err(error) => {
+            step.stop("Curation failed; skipping persist to preserve finalized artifacts");
+            return (Err(vec![error]), errors);
+        }
+    };
+    if views.base.is_empty()
+        && views.xtream.is_none()
+        && views.publication_plan == PlaylistPublicationPlan::Ordinary
+        && prepared.accepted_empty_clusters.is_empty()
+        && !library_empty.replaces_empty_target()
+    {
+        step.stop("");
+        info!("Playlist is empty: {}", target.name);
+        return (Ok(()), errors);
+    }
+    if views.publication_plan != PlaylistPublicationPlan::Ordinary {
+        step.tick("target curation");
+        log_memory_snapshot(format!("target '{}' after_curation", target.name).as_str());
+    }
+
+    let mut finalized_base = finalize_playlist_view(target, views.base, &mut step, "base");
+    let mut finalized_xtream =
+        views.xtream.map(|playlist| finalize_playlist_view(target, playlist, &mut step, "Xtream"));
+    retain_epg_referenced_by_groups(&finalized_base, &mut new_epg);
+
+    let merged_epg = if ctx.config.config.load().disk_based_processing {
+        // Per-source drain to disk, then multi-way merge. Errors are pushed
+        // to `errors` rather than `?` because the function returns
+        // `(Result, Vec<TuliproxError>)`, not `Result` directly. We must
+        // surface tempdir / write / merge failures — the user opted in to
+        // disk spilling, and silently falling back to the in-memory path
+        // can OOM on large feeds. When the spill itself fails we skip the
+        // persist step entirely: continuing with `merged_epg = None` would
+        // overwrite the existing on-disk EPG with nothing and discard the
+        // previously persisted artifact on a transient error.
+        match spill_epg_to_disk(new_epg) {
+            Ok(epg) => epg,
+            Err(err) => {
+                let result_error = TuliproxError::new(err.kind(), err.message());
+                errors.push(err);
+                step.stop("EPG spill failed; skipping persist to preserve existing EPG");
+                log_memory_snapshot(format!("target '{}' after_persist", target.name).as_str());
+                return (Err(vec![result_error]), errors);
+            }
+        }
+    } else {
+        flatten_tvguide(new_epg)
+    };
+    let library_empty = library_empty.for_filtered_playlist(&finalized_base);
+    let result = persist_playlist_views(
+        &ctx.config,
+        &mut finalized_base,
+        finalized_xtream.as_deref_mut(),
+        merged_epg.as_ref(),
+        target,
+        ctx.playlist_state.as_ref(),
+        TargetPlaylistPersistOptions {
+            accepted_empty_clusters: prepared.accepted_empty_clusters,
+            library_empty,
+            publication_plan: views.publication_plan,
+        },
+    )
+    .await;
+    let watch_playlist = target_watch_view(&finalized_base, finalized_xtream.as_deref());
+    if result.is_ok() && process_watch(&ctx.config, &ctx.events, target, watch_playlist).await {
+        step.tick("group watches");
+        log_memory_snapshot(format!("target '{}' after_group_watches", target.name).as_str());
+    }
+    step.stop("Persisting playlists");
+    log_memory_snapshot(format!("target '{}' after_persist", target.name).as_str());
+    (result, errors)
 }
 
 pub(crate) async fn playlist_resolve<E: EventSink + Clone + 'static, M: MetadataUpdateSink>(
@@ -802,23 +894,184 @@ pub fn process_favourites(playlist: &mut Vec<PlaylistGroup>, favourites_cfg: Opt
     }
 }
 
-pub(crate) async fn trakt_playlist(
-    client: &reqwest::Client,
-    target: &ConfigTarget,
-    playlist: &mut Vec<PlaylistGroup>,
-) -> bool {
-    let Some(trakt_config) = target.get_xtream_output().and_then(|output| output.trakt.as_ref()) else {
-        trace!("No Trakt configuration found for target {}", target.name);
-        return false;
-    };
-    let Some(trakt_categories) = curate_trakt_categories(client, playlist, &target.name, trakt_config).await else {
-        return false;
-    };
-    if !trakt_categories.is_empty() {
-        info!("Adding {} Trakt categories to playlist", trakt_categories.len());
-        playlist.extend(trakt_categories);
+#[derive(Debug)]
+pub(crate) struct TargetPlaylistViews {
+    pub(crate) base: Vec<PlaylistGroup>,
+    pub(crate) xtream: Option<Vec<PlaylistGroup>>,
+    pub(crate) publication_plan: PlaylistPublicationPlan,
+}
+
+pub(crate) fn build_curated_playlist_views(
+    playlist: Vec<PlaylistGroup>,
+    evaluation: &CurationEvaluation,
+    config: &CurationConfig,
+    appearance_filter_configured: bool,
+    has_xtream_output: bool,
+) -> TargetPlaylistViews {
+    let curated_catalog = config.catalog_selection.is_curated();
+    let categories = has_xtream_output.then(|| project_curation_categories(evaluation, &playlist, config));
+    let base = select_target_catalog(playlist, evaluation, curated_catalog);
+    let xtream = categories.map(|mut categories| {
+        let mut view = if config.include_xtream_base_categories { base.clone() } else { live_only(&base) };
+        view.append(&mut categories);
+        view
+    });
+    TargetPlaylistViews {
+        base,
+        xtream,
+        publication_plan: PlaylistPublicationPlan::complete_curation_with_filter(
+            curated_catalog,
+            has_xtream_output && !config.include_xtream_base_categories,
+            appearance_filter_configured,
+        ),
     }
-    true
+}
+
+pub(crate) async fn prepare_target_playlist_views(
+    client: &reqwest::Client,
+    tmdb_client: Option<&reqwest::Client>,
+    target: &ConfigTarget,
+    playlist: Vec<PlaylistGroup>,
+) -> Result<TargetPlaylistViews, TuliproxError> {
+    let Some(config) = target.effective_curation() else {
+        return Ok(TargetPlaylistViews {
+            base: playlist,
+            xtream: None,
+            publication_plan: PlaylistPublicationPlan::Ordinary,
+        });
+    };
+
+    let outcome = evaluate_curation(client, tmdb_client, &playlist, &target.name, &config).await;
+    curation_playlist_views(target, playlist, &config, outcome)
+}
+
+pub(super) fn curation_playlist_views(
+    target: &ConfigTarget,
+    playlist: Vec<PlaylistGroup>,
+    config: &CurationConfig,
+    outcome: CurationRunOutcome,
+) -> Result<TargetPlaylistViews, TuliproxError> {
+    match outcome {
+        CurationRunOutcome::NotConfigured => Ok(TargetPlaylistViews {
+            base: playlist,
+            xtream: None,
+            publication_plan: PlaylistPublicationPlan::Ordinary,
+        }),
+        CurationRunOutcome::Failed(failure) => Err(curation_failure_error(&target.name, &failure)),
+        CurationRunOutcome::Complete(evaluation) => {
+            let views = build_curated_playlist_views(
+                playlist,
+                &evaluation,
+                config,
+                target.filter.persist.is_some(),
+                target.get_xtream_output().is_some(),
+            );
+            info!(
+                "Target '{}' curation completed with {} memberships and {} Xtream groups",
+                target.name,
+                evaluation.memberships.len(),
+                views.xtream.as_deref().map_or(0, <[PlaylistGroup]>::len)
+            );
+            Ok(views)
+        }
+    }
+}
+fn curation_failure_error(target_name: &str, failure: &CurationFailure) -> TuliproxError {
+    let mut complete = 0usize;
+    let mut incomplete = 0usize;
+    let mut unavailable = 0usize;
+    for outcome in &failure.selector_outcomes {
+        match outcome {
+            SelectorOutcome::Complete { .. } => complete += 1,
+            SelectorOutcome::Incomplete { .. } => incomplete += 1,
+            SelectorOutcome::Unavailable { .. } => unavailable += 1,
+        }
+    }
+    TuliproxError::RepositoryPlaylist(format!(
+        "Target '{target_name}' curation refresh failed (complete selectors: {complete}, incomplete: {incomplete}, unavailable: {unavailable}); existing finalized artifacts were retained"
+    ))
+}
+
+fn item_subject_uuid(item: &PlaylistItem) -> UUIDType {
+    if item.header.uuid == UUIDType::default() {
+        item.get_uuid()
+    } else {
+        item.header.uuid
+    }
+}
+
+fn selected_series_parent_keys(playlist: &[PlaylistGroup], selected_subjects: &HashSet<UUIDType>) -> HashSet<Arc<str>> {
+    let mut parent_keys = HashSet::new();
+    for item in playlist.iter().flat_map(|group| &group.channels) {
+        if !matches!(item.header.item_type, PlaylistItemType::SeriesInfo | PlaylistItemType::LocalSeriesInfo)
+            || !selected_subjects.contains(&item_subject_uuid(item))
+        {
+            continue;
+        }
+        parent_keys.insert(item.get_uuid().intern());
+        if item.header.uuid != UUIDType::default() {
+            parent_keys.insert(item.header.uuid.intern());
+        }
+        if item.header.virtual_id.get() != 0 {
+            parent_keys.insert(item.header.virtual_id.get().to_string().intern());
+        }
+        if item.header.item_type == PlaylistItemType::LocalSeriesInfo && !item.header.id.is_empty() {
+            parent_keys.insert(Arc::clone(&item.header.id));
+        }
+    }
+    parent_keys
+}
+
+pub(crate) fn select_target_catalog(
+    mut playlist: Vec<PlaylistGroup>,
+    evaluation: &CurationEvaluation,
+    enabled: bool,
+) -> Vec<PlaylistGroup> {
+    if !enabled {
+        return playlist;
+    }
+
+    let selected_subjects =
+        evaluation.memberships.iter().map(|membership| membership.subject_uuid).collect::<HashSet<_>>();
+    let selected_parent_keys = selected_series_parent_keys(&playlist, &selected_subjects);
+
+    for group in &mut playlist {
+        group.channels.retain(|item| {
+            if item.header.xtream_cluster == XtreamCluster::Live {
+                return true;
+            }
+            match item.header.item_type {
+                PlaylistItemType::Video
+                | PlaylistItemType::LocalVideo
+                | PlaylistItemType::SeriesInfo
+                | PlaylistItemType::LocalSeriesInfo => selected_subjects.contains(&item_subject_uuid(item)),
+                PlaylistItemType::Series | PlaylistItemType::LocalSeries => {
+                    selected_parent_keys.contains(&item.header.parent_code)
+                }
+                _ => false,
+            }
+        });
+    }
+    playlist.retain(|group| group.xtream_cluster == XtreamCluster::Live || !group.channels.is_empty());
+    playlist
+}
+
+fn live_only(playlist: &[PlaylistGroup]) -> Vec<PlaylistGroup> {
+    playlist
+        .iter()
+        .filter_map(|group| {
+            let mut live_group = group.clone();
+            live_group.channels.retain(|item| item.header.xtream_cluster == XtreamCluster::Live);
+            (group.xtream_cluster == XtreamCluster::Live || !live_group.channels.is_empty()).then_some(live_group)
+        })
+        .collect()
+}
+
+pub(crate) fn target_watch_view<'playlist>(
+    base: &'playlist [PlaylistGroup],
+    xtream: Option<&'playlist [PlaylistGroup]>,
+) -> &'playlist [PlaylistGroup] {
+    xtream.unwrap_or(base)
 }
 
 pub(crate) async fn process_watch<E: EventSink>(

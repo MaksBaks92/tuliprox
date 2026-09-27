@@ -4,6 +4,13 @@
 
 ## ⚠️ Breaking Changes
 
+- **The per-input resource policy is gone again.** `resource_policy` (with `allowed_hosts` / `allowed_networks`) is no
+  longer a valid input field, so configurations written for that feature are rejected while loading, and resource links
+  minted by it are no longer accepted. Resource destinations are classified instead of configured: a destination on a
+  private network is proxied, a public one may be handed to the client directly. Resource links that were issued
+  before this change (the `obscure_text` format) are rejected as well, so an EPG a client has already cached shows
+  broken icons until the EPG is fetched again.
+
 - **The Web UI WebSocket protocol is now version 4.** Playlist update completion messages carry the correlated
   run ID and execution order instead of a bare status. Reload existing browser tabs after upgrading the server;
   version-3 clients are rejected during the handshake rather than receiving incompatible update messages.
@@ -26,9 +33,13 @@
   provider inputs (with `enabled`, `live_source`, `vod_source`, and `series_source`) has been removed.
   A staged source is now its own input with `type: staged`. It points to one non-staged `m3u` /
   `xtream` provider through `staged.for_input`, and `staged.clusters` selects which clusters (`live`,
-  `vod`, `series`) are loaded from the staged playlist. Clusters not selected there are loaded from the
-  provider input itself. The merged result is stored under the provider input, so playlist delivery and
-  stream/API routing continue to use the provider.
+  `vod`, `series`) are overlaid by the staged playlist. Inside such a cluster of an `xtream` provider each staged group
+  replaces the provider category it belongs to, matched by the staged channels' stream IDs and only then by category ID
+  or group title; provider categories without a staged counterpart stay as they are. For any other provider type the
+  selected clusters are replaced entirely by the staged groups, and the clusters not selected are loaded from the
+  provider input itself. The merged result is stored under the provider input, so playlist delivery and stream/API
+  routing continue to use the provider. See
+  [Staged Sources](docs/src/configuration/source.md#25-staged-sources-staged) for the matching rules.
 
   Before:
 
@@ -110,11 +121,34 @@
 
 ## 🌟 New Features
 
+- **Target-owned discovery with TMDB Trending.** `target.curation` combines optional Trakt and TMDB sources under one
+  `full`/`curated` policy. TMDB supports movie/TV day/week feeds with a unique-reference `limit` (default 100, range
+  1..=500) and guarded internal pagination. It uses its own Bearer token, exact same-kind TMDB-ID matching, and optional
+  Xtream category projection. Every active selector is required; failed fetches retain finalized target artifacts in both
+  modes. M3U/STRM keep normal selected entries, without Xtream aliases.
+  Legacy `output[].trakt` remains supported but cannot coexist with the new declaration on one target. Source Editor
+  preserves the YAML-owned block and shows ownership hints; the dashboard version card now includes TMDB Credits.
+
 - **Runtime liveness watchdog.** An optional heartbeat/watchdog detects a wedged
   async runtime (process alive, scheduler no longer making progress, logs stop) and logs a diagnostic snapshot with
   runtime metrics and a per-thread `/proc/self/task` inventory. It is opt-in and off by default (`TULIPROX_WATCHDOG=1`
   to observe, `=2` to also restart the process on a confirmed stall), and exposes its state through the `/healthcheck`
   `runtime` object.
+
+- **Trakt curation can now select one target-wide VOD/Series catalog and project Xtream categories independently.**
+  `output[].trakt.catalog_selection` accepts `full` (the compatibility default) or `curated`;
+  `include_xtream_base_categories` defaults to `true`; and each list/chart has a default-true
+  `create_xtream_category`. Existing YAML therefore keeps the full catalog, normal Xtream categories, and current
+  category-scoped alias IDs. Selection-only selectors may omit `category_name`, while category-producing selectors
+  still require it. The Source Editor exposes the same controls in all supported locales.
+  - Curation now evaluates exact surviving target UUIDs after favourites, group merge, and post-merge content
+    deduplication. M3U and STRM receive selected normal entries rather than Xtream aliases, while Xtream watch behavior
+    continues to observe its category view.
+  - Every enabled list/chart is required for a refresh. Partial selector success, missing/invalid credentials, request
+    failures, malformed responses, and incomplete pagination now fail that target before IDs, persistence, cache, or
+    watch effects instead of publishing a partial/base fallback.
+  - A complete empty or no-match result under `catalog_selection: curated` intentionally clears managed VOD/Series
+    Xtream, M3U, and STRM state while preserving Live. Ordinary or failed empty refreshes retain previous artifacts.
 
 - **`.env` file support for secrets and environment variables:** Tuliprox now automatically loads environment variables
   from a `.env` file at startup.
@@ -991,6 +1025,74 @@
 
 ## 🐛 Fixes
 
+- **Stalker playback resolution now says why it failed, retries a rejected session, and can fall back to the stored
+  command.** A playback request that could not be resolved reported a single message naming the requested item's portal
+  id, while the actual cause — no published catalog for the configured portal identity, an item missing from the active
+  generation, an item without a playback descriptor, or a `create_link` refusal — was written to the debug log or
+  nowhere at all, which made a portal refusal look like a mismatched stream id. Each of these stages now logs at warning
+  level with the input name, stream id, item name and the portal's sanitized error, and the resolution reports the
+  portal's reason once its candidates are exhausted. A portal that rejects the session (HTTP 204/401/403/456, or a
+  Ministra `code` of 44 / 440..=449 inside a `200 OK`) no longer ends as "could not be resolved": the cached session is
+  dropped, a fresh handshake is issued and the request is retried once, which is the recovery the typed token-rejection
+  error was introduced for but nothing called. Items whose persisted playback descriptor is empty now resolve through
+  their stored `cmd`, so a row that still carries the portal command stays playable.
+- **A playback request no longer discards the published Stalker catalog.** The active-manifest lookup used by playback
+  resolution and by the disk playlist sources replaced the published manifest with an empty one and deleted the refresh
+  checkpoint whenever the stored identity did not match the configured one — for example after editing the input's
+  Stalker block or changing the MAG preset. The catalog files survived but nothing could resolve, and the running
+  refresh lost its resume point. Read paths now report "no published catalog for this identity" and leave the
+  publication state to the refresh that owns it.
+- **Resource URLs no longer expose internal destinations.** Resource URLs are classified before they are written into
+  playlist or EPG output: only a provably public destination is handed to the client, everything else (`tvg-logo`,
+  `tvg-logo-small`, Xtream covers and backdrops, EPG channel and programme icons, Web UI item icons) is replaced by an
+  authenticated resource link. This also covers redirect mode (`resource_rewrite_disabled: true`), where a
+  network-internal image is proxied instead of being published, and an image without a client-visible base URL is dropped
+  rather than written through. Destinations local to the Tuliprox host — loopback, link-local, cloud metadata — are
+  dropped from the output and refused by the resource route, and an upstream failure is reported as a generic
+  `502 Bad Gateway` instead of relaying the destination's error response. The refusal also happens while the connection
+  is built, so a destination cannot resolve to a public address during the check and to a local one afterwards. A name
+  whose lookup produced no answer stays non-public for ten seconds rather than for minutes, so a resolver hiccup does
+  not pin a destination to the proxy for the rest of its verdict lifetime.
+- **Resource proxying keeps respecting the configured proxy.** Every redirect hop of a resource URL is classified on
+  its own: a hop that is not provably public connects directly, so a self-hosted media server on the local network stays
+  reachable, while every other hop - including the public destinations of the Web UI resource route and a public hop
+  reached through a redirect - goes through the configured `proxy` block. Resource requests therefore cannot disclose
+  the operator's address to a resource host. A redirect to a destination local to the Tuliprox host is refused without
+  being requested, and both resource clients refuse such an address again while the connection is built, so a name that
+  was classified as public cannot resolve to a local address afterwards. The configured proxy hosts are exempt from
+  that guard, so a proxy on the loopback interface (`proxy: http://localhost:8118`) keeps working instead of making
+  every public resource fetch fail. A resource name that does not resolve locally is fetched through the configured
+  proxy, which can still resolve it (for example with remote DNS); a destination that resolves to a private address
+  keeps connecting directly. Redirects are followed one hop at a time, bounded to five hops.
+
+- **Duplicate input and alias names fail the configuration load again.** Input names and alias names share one
+  namespace, and a duplicate silently resolved to whichever member was inserted last, so a request could run against
+  another input's playlist, credentials, and limits. The check that rejects such a configuration is part of the sources
+  load again, which also means an invalid reload is reported instead of replacing the running configuration.
+
+- **Streaming and connection management: resolved silent async hang / deadlock during client kicks and concurrent stream load.**
+  Under concurrent stream traffic, `tuliprox` would occasionally stop logging and serving requests (the Web UI became
+  unreachable and active streams dropped) while the container remained in a running state with near-zero CPU and memory
+  usage. Thread inspection revealed Tokio worker threads parked in `futex_wait` or `epoll_wait` with no crash or panic.
+
+  Several interrelated issues contributed to this stall:
+  - Hyper's HTTP/1.1 `graceful_shutdown()` only prevents accepting subsequent requests on keep-alive connections; it does
+    not abort active streaming response bodies. When a client was kicked while streaming live media, the server's serve
+    loop waited indefinitely on `conn.as_mut().await` as long as the client continued reading bytes, postponing the
+    associated upstream provider release and holding provider slots indefinitely. Forced socket closures now actively
+    drop the connection transport (`drop(conn)`), terminating in-flight response bodies and triggering immediate provider
+    cleanup.
+  - Connection close signals were delivered via unaddressed broadcasts, meaning an unrelated receiver could report
+    delivery success even if no transport task listened for the target socket address, causing the fallback provider
+    cleanup on kicks to be skipped. A per-socket `SocketCloseState` (`Open` / `Closing`) using oneshot channels now
+    ensures targeted signal delivery, preserves provider allocations across duplicate kicks until transport termination,
+    and reliably invokes fallback provider cleanup when unreceived.
+  - In `ActiveUserManager`, empty user records were removed by dropping and re-acquiring the write lock on the connections
+    registry, causing severe lock thrashing and starvation against concurrent periodic tasks (such as active user logging).
+    Empty user records are now removed atomically under the same lock acquisition.
+  - In `SharedStreamManager`, the shared registry lock guard is now explicitly dropped prior to secondary asynchronous
+    cleanup and meter token cancellation.
+
 - **Provider priority was ignored and a second concurrent client failed with a source error while capacity was free.**
   Provider-slot reservations were granted as soon as a playback opened a provider, so an HLS/DASH entry that only ever
   served a manifest — or a player that retried its manifest and gave up — still held a reservation for the whole
@@ -1484,10 +1586,23 @@
 
 ## 🛠 Maintenance
 
-- **Playlist curation now has a dedicated capability boundary**: matching, ordering, and virtual-category projection
-  live in the source-neutral `tuliprox-curation` crate, while Trakt HTTP/JSON handling translates records at the edge.
-  Existing `output[].trakt` configuration, category identity, matching behavior, and partial-success semantics remain
-  unchanged.
+- **The testkit can now drive a Stalker/Ministra input.** The fixture origin emulates a portal
+  (`handshake`, `get_profile`, `get_genres`, `get_ordered_list`, `create_link`), a scenario selects it with
+  `input_type: stalker` plus a `stalker:` block (MAC, MAG preset, scripted `create_link` refusals), and the
+  generated `source.yml` points the input at it. Playback resolution is asserted where it is observable — on the
+  portal: `assert_origin` gained `stalker_handshakes_at_least`, `stalker_create_links_at_least`,
+  `stalker_token_refusals_at_least` and `stalker_create_link_markers` (set comparison, so a playback that resolved
+  another catalog item's command fails). Three scenarios use it: `stalker-live-resolution` (each channel resolves
+  through its own stored `cmd`), `stalker-session-refused-once` (a stale-session refusal is recovered by a
+  re-handshake and retry; fails without that recovery) and `stalker-refused-channel-keeps-catalog` (a permanently
+  refused channel is reported and the catalog keeps serving the others). The fixture portal answers with a loopback
+  stream URL on purpose: the SUT's destination guard refuses it, so the scenarios assert the resolution chain and
+  the guard instead of pretending a portal-supplied private URL is playable. Asserting a hard upstream failure
+  needed a new expectation, `expect: { http_error: <status> }`.
+- **Playlist curation now has a dedicated capability boundary**: matching and ordered membership evaluation live in the
+  source-neutral `tuliprox-curation` kernel, while Trakt HTTP/JSON handling translates records at the edge and the
+  category-scoped compatibility projector remains separate from membership identity. Existing category identity and
+  matching rules remain unchanged; the target-wide selection entry above documents the intentional outcome changes.
 
 - **`AdmissionRequest` bundles the request-scoped admission arguments**: five functions each threaded the same ten
   positional parameters, three of them consecutive bare `bool`s (`use_session_admission`, then

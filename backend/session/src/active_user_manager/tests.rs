@@ -210,6 +210,7 @@ async fn create_user_session_normalizes_expired_lifecycle() {
             provider: "provider-a".intern(),
             stream_url: "http://localhost/live.m3u8".intern(),
             provider_session_headers: HashMap::new(),
+            media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             user_agent_stream_index: None,
             addr,
             socket_bound: false,
@@ -272,6 +273,7 @@ async fn create_user_session_does_not_normalize_pending_provider_lifecycle() {
             provider: "provider-a".intern(),
             stream_url: "http://localhost/live.m3u8".intern(),
             provider_session_headers: HashMap::new(),
+            media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             user_agent_stream_index: None,
             addr,
             socket_bound: false,
@@ -1482,6 +1484,47 @@ async fn eviction_candidates_ignore_ambiguous_socket_addrs() {
     let candidates = manager.get_eviction_candidates("same-user", "127.0.0.1").await;
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].addr, unique_addr);
+}
+
+#[tokio::test]
+async fn eviction_candidates_include_charged_stream_with_uncounted_session() {
+    let config = Config::default();
+    let geoip = Arc::new(ArcSwapOption::<GeoIp>::default());
+    let event_manager = Arc::new(EventManager::new());
+    let manager = ActiveUserManager::new(&config, &geoip, &event_manager);
+
+    let addr: SocketAddr = "127.0.0.1:55034".parse().unwrap();
+    let fingerprint = Fingerprint::new("fp-switch".to_string(), "10.41.41.170".to_string(), addr);
+    let username = "switch-user";
+    manager.add_connection(&addr).await;
+    manager
+        .update_connection(ActiveUserConnectionParams {
+            uid: 34,
+            meter_uid: 0,
+            username,
+            max_connections: 1,
+            soft_connections: 0,
+            connection_kind: ConnectionKind::Normal,
+            priority: 0,
+            soft_priority: 0,
+            fingerprint: &fingerprint,
+            provider: "provider-a".intern(),
+            stream_channel: &test_channel(1034),
+            user_agent: Cow::Borrowed("ua"),
+            session_token: Some("missing-session"),
+        })
+        .await;
+
+    assert_eq!(manager.user_connections(username).await, 1);
+    assert_eq!(manager.connection_permission(username, 1, 0).await, UserConnectionPermission::Exhausted);
+
+    let candidates = manager.get_eviction_candidates(username, &fingerprint.client_ip).await;
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].addr, addr);
+    assert_eq!(candidates[0].client_ip, fingerprint.client_ip);
+
+    manager.release_connection_as_kicked(&addr).await;
+    assert_eq!(manager.connection_permission(username, 1, 0).await, UserConnectionPermission::Allowed);
 }
 
 #[tokio::test]
@@ -4444,6 +4487,66 @@ async fn vod_session_survives_overlapping_and_seek_sockets() {
 }
 
 #[tokio::test]
+async fn update_session_provider_binding_updates_session_and_streams() {
+    let config = Config::default();
+    let geoip = Arc::new(ArcSwapOption::<GeoIp>::default());
+    let event_manager = Arc::new(EventManager::new());
+    let manager = ActiveUserManager::new(&config, &geoip, &event_manager);
+
+    let addr: SocketAddr = "127.0.0.1:55140".parse().unwrap();
+    let mut user = ProxyUserCredentials::default();
+    user.username = String::from("user1");
+    user.max_connections = 1;
+
+    manager.add_connection(&addr).await;
+    manager
+        .create_user_session(CreateUserSessionParams {
+            user: &user,
+            session_token: "tok-binding",
+            virtual_id: 100,
+            provider: "account-b",
+            stream_url: "http://example.com/vod/movie.mkv?token=account-b",
+            addr: &addr,
+            connection_permission: UserConnectionPermission::Allowed,
+            connection_kind: Some(ConnectionKind::Normal),
+            socket_bound: false,
+        })
+        .await;
+
+    {
+        let mut connections = manager.connections.write().await;
+        let data = connections.by_key.get_mut("user1").expect("user connection data");
+        data.streams.push(StreamInfo::new(shared::model::StreamInfoParams {
+            uid: 1,
+            meter_uid: 1,
+            username: &user.username,
+            addr: &addr,
+            client_ip: "127.0.0.1",
+            provider: "account-b".intern(),
+            stream_channel: test_channel(100),
+            user_agent: "ua".to_string(),
+            country_code: None,
+            session_token: Some("tok-binding"),
+        }));
+    }
+
+    manager
+        .update_session_provider_binding(
+            "user1",
+            "tok-binding",
+            "account-a".intern(),
+            "http://example.com/vod/movie.mkv?token=account-a".into(),
+        )
+        .await;
+
+    let connections = manager.connections.read().await;
+    let connection_data = connections.by_key.get("user1").expect("user connection data");
+    assert_eq!(connection_data.sessions[0].provider.as_ref(), "account-a");
+    assert_eq!(connection_data.sessions[0].stream_url.as_ref(), "http://example.com/vod/movie.mkv?token=account-a");
+    assert_eq!(connection_data.streams[0].provider.as_ref(), "account-a");
+}
+
+#[tokio::test]
 async fn catchup_release_connection_preserves_logical_stream_until_session_expires() {
     let config = Config::default();
     let geoip = Arc::new(ArcSwapOption::<GeoIp>::default());
@@ -5784,6 +5887,7 @@ async fn check_divergence_detects_connection_count_mismatch() {
             provider: "provider-a".intern(),
             stream_url: "http://localhost/stream.ts".intern(),
             provider_session_headers: HashMap::new(),
+            media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             user_agent_stream_index: None,
             addr,
             socket_bound: false,
@@ -5828,6 +5932,7 @@ async fn check_divergence_detects_stream_without_counted_session() {
             provider: "provider-a".intern(),
             stream_url: "http://localhost/stream.ts".intern(),
             provider_session_headers: HashMap::new(),
+            media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             user_agent_stream_index: None,
             addr,
             socket_bound: false,
@@ -5913,6 +6018,7 @@ async fn divergence_log_rate_limited_within_cooldown_window() {
             provider: "provider-a".intern(),
             stream_url: "http://localhost/stream.ts".intern(),
             provider_session_headers: HashMap::new(),
+            media_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             user_agent_stream_index: None,
             addr,
             socket_bound: false,

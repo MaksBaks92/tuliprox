@@ -5,10 +5,10 @@ use crate::{
             create_playback_session_fingerprint, create_session_fingerprint, force_provider_stream_response,
             get_session_reservation_ttl_secs, get_user_target, get_user_target_by_credentials,
             is_seekable_media_request, is_session_based_playback, is_stream_share_enabled, local_stream_response,
-            redirect, redirect_response, reentry_suppressed_response, resolve_initial_stalker_playback_url,
-            resource_response, separate_number_and_remainder, should_allow_exhausted_shared_reconnect, stream_response,
-            try_option_bad_request, try_result_bad_request, try_result_not_found, try_unwrap_body, RedirectParams,
-            ResourceFetchPolicy,
+            redirect_response, reentry_suppressed_response, resolve_initial_stalker_playback_url,
+            resource_proxy_response, resource_redirect_or_proxy, separate_number_and_remainder,
+            should_allow_exhausted_shared_reconnect, stream_response, try_option_bad_request, try_result_bad_request,
+            try_result_not_found, try_unwrap_body, RedirectParams,
         },
         endpoints::{
             hls_api::{
@@ -931,6 +931,10 @@ async fn m3u_api_resource(
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
 
+    if !shared::model::is_resource_field_name(&resource) {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+
     let stream_url = m3u_item.get_field(resource.as_str());
     match stream_url {
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
@@ -940,8 +944,8 @@ async fn m3u_api_resource(
                 let redirect_url = crate::api::api_utils::resolve_redirect_location(input.as_deref(), &url);
                 match redirect_url {
                     Ok(redirect_url) => {
-                        debug!("Redirecting stream request to {}", sanitize_sensitive_info(redirect_url.as_ref()));
-                        redirect(redirect_url.as_ref()).into_response()
+                        resource_redirect_or_proxy(&app_state, redirect_url.as_ref(), &req_headers, input.as_deref())
+                            .await
                     }
                     Err(err) => {
                         error!("Failed to resolve redirect url: {}", sanitize_sensitive_info(&err.to_string()));
@@ -949,9 +953,10 @@ async fn m3u_api_resource(
                     }
                 }
             } else {
-                resource_response(&app_state, ResourceFetchPolicy::Standard, &url, &req_headers, None)
-                    .await
-                    .into_response()
+                // The response narrows the input to the resource origin itself; passing the input of
+                // the item keeps that decision in one place.
+                let input = app_state.app_config.get_input_by_name(&m3u_item.input_name);
+                resource_proxy_response(&app_state, &url, &req_headers, input.as_deref()).await
             }
         }
     }

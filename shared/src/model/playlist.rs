@@ -8,9 +8,10 @@ use crate::{
     },
     utils::{
         arc_str_option_serde, arc_str_serde, concat_path, extract_extension_from_url, generate_provider_playlist_uuid,
-        generate_runtime_playlist_uuid, get_provider_id, obfuscate_text, Internable,
+        generate_runtime_playlist_uuid, get_provider_id, seal_web_ui_resource_url, Internable,
     },
 };
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Display, Formatter, Write},
@@ -886,7 +887,13 @@ impl crate::model::FieldGetAccessor for M3uPlaylistItem {
     #[inline]
     fn get_field(&self, field: &str) -> Option<Arc<str>> {
         use crate::model::FieldGet;
-        self.get(HeaderField::parse(field)?).map(|value| value.to_arc())
+        let field = HeaderField::parse(field)?;
+        let value = self.get(field)?.to_arc();
+        Some(if matches!(field, HeaderField::Logo | HeaderField::LogoSmall) {
+            super::persisted_resource_arc(&value)
+        } else {
+            value
+        })
     }
 }
 
@@ -913,6 +920,14 @@ pub struct XtreamMappingOptions {
     pub base_url: String,
     pub web_ui_request: bool,
     pub encrypt_secret: [u8; 16],
+    pub resource_host_policies: Arc<DashMap<String, ResourceOutputPolicy>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceOutputPolicy {
+    Direct,
+    Proxy,
+    Blocked,
 }
 
 impl XtreamMappingOptions {
@@ -929,9 +944,10 @@ impl XtreamMappingOptions {
         xtream_cluster: XtreamCluster,
         item_type: PlaylistItemType,
         virtual_id: VirtualId,
+        force_proxy: bool,
     ) -> Option<String> {
         let proxy_resource = self.resource_proxy_item_types.is_set(item_type);
-        if proxy_resource && self.flags.contains(XtreamMappingFlags::RewriteResourceUrl) {
+        if force_proxy || (proxy_resource && self.flags.contains(XtreamMappingFlags::RewriteResourceUrl)) {
             Some(format!(
                 "{}/resource/{}/{}/{}/{}",
                 self.base_url,
@@ -945,6 +961,34 @@ impl XtreamMappingOptions {
         }
     }
 
+    fn resource_output_policy(&self, resource_url: &str) -> ResourceOutputPolicy {
+        if self.flags.contains(XtreamMappingFlags::RewriteResourceUrl) {
+            return ResourceOutputPolicy::Proxy;
+        }
+        if resource_url.starts_with("media-server://image/") {
+            return ResourceOutputPolicy::Proxy;
+        }
+        let Ok(url) = url::Url::parse(resource_url) else {
+            return if resource_url.starts_with("//")
+                || resource_url.starts_with("http:")
+                || resource_url.starts_with("https:")
+            {
+                ResourceOutputPolicy::Blocked
+            } else {
+                ResourceOutputPolicy::Direct
+            };
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return ResourceOutputPolicy::Blocked;
+        }
+        let Some(host) = url.host_str() else {
+            return ResourceOutputPolicy::Blocked;
+        };
+        // A host missing from the prepared set still needs a proxy link; a new resource
+        // field must not expose its origin before the output classifier knows the host.
+        self.resource_host_policies.get(host).map_or(ResourceOutputPolicy::Proxy, |entry| *entry)
+    }
+
     pub fn get_resource_url(
         &self,
         xtream_cluster: XtreamCluster,
@@ -953,30 +997,11 @@ impl XtreamMappingOptions {
         resource_url: &str,
         resource_field: &str,
     ) -> String {
-        if !self.web_ui_request && Self::is_trusted_web_ui_resource_path(resource_url) {
-            return concat_path(&self.base_url, resource_url);
-        }
-
-        if self.web_ui_request {
-            if resource_url.is_empty() {
-                return resource_url.to_string();
-            }
-            if Self::is_trusted_web_ui_resource_path(resource_url) {
-                return resource_url.to_string();
-            }
-            let rewrite_url = concat_path(&self.base_url, &obfuscate_text(&self.encrypt_secret, resource_url));
-            return rewrite_url;
-        }
-
-        let rewrite_url = self.build_reverse_proxy_base_url(xtream_cluster, item_type, virtual_id);
-
-        if let Some(url) = rewrite_url {
-            if resource_url.starts_with("http://") || resource_url.starts_with("https://") {
-                return format!("{url}/{resource_field}");
-            }
-        }
-        resource_url.to_string()
+        self.rewrite_resource_url_inner(xtream_cluster, item_type, virtual_id, resource_url, |base| {
+            format!("{base}/{resource_field}")
+        })
     }
+
     pub fn get_bd_path_resource_url(
         &self,
         xtream_cluster: XtreamCluster,
@@ -986,6 +1011,23 @@ impl XtreamMappingOptions {
         resource_field: &str,
         index: usize,
     ) -> String {
+        self.rewrite_resource_url_inner(xtream_cluster, item_type, virtual_id, resource_url, |base| {
+            format!("{base}/{resource_field}{}_{index}", xtream_const::XC_PROP_BACKDROP_PATH)
+        })
+    }
+
+    fn rewrite_resource_url_inner(
+        &self,
+        xtream_cluster: XtreamCluster,
+        item_type: PlaylistItemType,
+        virtual_id: VirtualId,
+        resource_url: &str,
+        proxy_suffix: impl FnOnce(&str) -> String,
+    ) -> String {
+        let Some(resource_url) = super::persisted_resource_url(resource_url) else {
+            return String::new();
+        };
+        let resource_url = resource_url.as_ref();
         if !self.web_ui_request && Self::is_trusted_web_ui_resource_path(resource_url) {
             return concat_path(&self.base_url, resource_url);
         }
@@ -997,15 +1039,26 @@ impl XtreamMappingOptions {
             if Self::is_trusted_web_ui_resource_path(resource_url) {
                 return resource_url.to_string();
             }
-            let rewrite_url = concat_path(&self.base_url, &obfuscate_text(&self.encrypt_secret, resource_url));
-            return rewrite_url;
+            return concat_path(&self.base_url, &seal_web_ui_resource_url(&self.encrypt_secret, resource_url));
         }
 
-        let rewrite_url = self.build_reverse_proxy_base_url(xtream_cluster, item_type, virtual_id);
+        let policy = self.resource_output_policy(resource_url);
+        if policy == ResourceOutputPolicy::Blocked {
+            return String::new();
+        }
+        let rewrite_url = self.build_reverse_proxy_base_url(
+            xtream_cluster,
+            item_type,
+            virtual_id,
+            policy == ResourceOutputPolicy::Proxy,
+        );
 
         if let Some(url) = rewrite_url {
-            if resource_url.starts_with("http://") || resource_url.starts_with("https://") {
-                return format!("{url}/{resource_field}{}_{index}", xtream_const::XC_PROP_BACKDROP_PATH);
+            if resource_url.starts_with("http://")
+                || resource_url.starts_with("https://")
+                || resource_url.starts_with("media-server://image/")
+            {
+                return proxy_suffix(&url);
             }
         }
         resource_url.to_string()
@@ -1093,14 +1146,72 @@ impl XtreamPlaylistItem {
         self.additional_properties.as_ref().is_some_and(super::stream_properties::StreamProperties::has_details)
     }
 
+    pub fn visit_resource_urls(&self, mut visit: impl FnMut(&str)) {
+        let mut visit_persisted = |value: &str| {
+            if let Some(url) = super::persisted_resource_url(value) {
+                visit(url.as_ref());
+            }
+        };
+        visit_persisted(&self.logo);
+        visit_persisted(&self.logo_small);
+        match self.additional_properties.as_ref() {
+            Some(StreamProperties::Live(live)) => visit_persisted(&live.stream_icon),
+            Some(StreamProperties::Video(video)) => {
+                visit_persisted(&video.stream_icon);
+                if let Some(details) = video.details.as_ref() {
+                    if let Some(url) = details.cover_big.as_deref() {
+                        visit_persisted(url);
+                    }
+                    if let Some(url) = details.movie_image.as_deref() {
+                        visit_persisted(url);
+                    }
+                    if let Some(backdrops) = details.backdrop_path.as_ref() {
+                        for url in backdrops {
+                            visit_persisted(url);
+                        }
+                    }
+                }
+            }
+            Some(StreamProperties::Series(series)) => {
+                visit_persisted(&series.cover);
+                if let Some(backdrops) = series.backdrop_path.as_ref() {
+                    for url in backdrops {
+                        visit_persisted(url);
+                    }
+                }
+                if let Some(details) = series.details.as_ref() {
+                    if let Some(seasons) = details.seasons.as_ref() {
+                        for season in seasons {
+                            for url in [&season.cover, &season.cover_tmdb, &season.cover_big].into_iter().flatten() {
+                                visit_persisted(url);
+                            }
+                        }
+                    }
+                    if let Some(episodes) = details.episodes.as_ref() {
+                        for episode in episodes {
+                            visit_persisted(&episode.movie_image);
+                        }
+                    }
+                }
+            }
+            Some(StreamProperties::Episode(episode)) => visit_persisted(&episode.movie_image),
+            None => {}
+        }
+    }
+
     pub fn resolve_resource_url(&self, field: &str) -> Option<Arc<str>> {
         let bytes = field.as_bytes();
-        if bytes.eq_ignore_ascii_case(b"logo") && !self.logo.is_empty() {
-            return Some(Arc::clone(&self.logo));
+        let url = if bytes.eq_ignore_ascii_case(b"logo") && !self.logo.is_empty() {
+            Some(Arc::clone(&self.logo))
         } else if bytes.eq_ignore_ascii_case(b"logo_small") && !self.logo_small.is_empty() {
-            return Some(Arc::clone(&self.logo_small));
-        }
-        self.additional_properties.as_ref().and_then(|a| a.resolve_resource_url(field))
+            Some(Arc::clone(&self.logo_small))
+        } else {
+            self.additional_properties.as_ref().and_then(|a| a.resolve_resource_url(field))
+        }?;
+        super::persisted_resource_url(&url).map(|decoded| match decoded {
+            std::borrow::Cow::Borrowed(_) => Arc::clone(&url),
+            std::borrow::Cow::Owned(value) => Arc::from(value),
+        })
     }
 }
 
@@ -1727,7 +1838,73 @@ mod tests {
             web_ui_request: true,
             flags: XtreamMappingFlags::RewriteResourceUrl.into(),
             encrypt_secret: [3u8; 16],
+            resource_host_policies: Arc::default(),
         }
+    }
+
+    #[test]
+    fn disabled_resource_rewrite_proxies_private_xtream_images() {
+        let mut options = sample_options();
+        options.web_ui_request = false;
+        options.base_url = "https://proxy.example".to_string();
+        options.flags = XtreamMappingFlagsSet::new();
+        options.resource_host_policies.insert("192.168.1.20".to_string(), ResourceOutputPolicy::Proxy);
+        options.resource_host_policies.insert("8.8.8.8".to_string(), ResourceOutputPolicy::Direct);
+        options.resource_host_policies.insert("127.0.0.1".to_string(), ResourceOutputPolicy::Blocked);
+
+        assert_eq!(
+            options.get_resource_url(
+                XtreamCluster::Live,
+                PlaylistItemType::Live,
+                VirtualId::new(1),
+                "http://192.168.1.20/logo.png",
+                "logo",
+            ),
+            "https://proxy.example/resource/live/user/pass/1/logo"
+        );
+        assert_eq!(
+            options.get_resource_url(
+                XtreamCluster::Live,
+                PlaylistItemType::Live,
+                VirtualId::new(1),
+                "http://8.8.8.8/logo.png",
+                "logo",
+            ),
+            "http://8.8.8.8/logo.png"
+        );
+        assert_eq!(
+            options.get_resource_url(
+                XtreamCluster::Live,
+                PlaylistItemType::Live,
+                VirtualId::new(1),
+                "http://127.0.0.1/logo.png",
+                "logo",
+            ),
+            ""
+        );
+        assert_eq!(
+            options.get_bd_path_resource_url(
+                XtreamCluster::Live,
+                PlaylistItemType::Live,
+                VirtualId::new(1),
+                "http://192.168.1.20/backdrop.png",
+                "",
+                0,
+            ),
+            "https://proxy.example/resource/live/user/pass/1/backdrop_path_0"
+        );
+
+        options.resource_proxy_item_types = PlaylistItemTypeSet::empty();
+        assert_eq!(
+            options.get_resource_url(
+                XtreamCluster::Live,
+                PlaylistItemType::Live,
+                VirtualId::new(1),
+                "http://192.168.1.20/logo.png",
+                "logo",
+            ),
+            "https://proxy.example/resource/live/user/pass/1/logo"
+        );
     }
 
     #[test]
@@ -1817,7 +1994,7 @@ mod tests {
                 resource_url,
                 "logo",
             ),
-            concat_path(&options.base_url, &obfuscate_text(&options.encrypt_secret, resource_url)),
+            concat_path(&options.base_url, &seal_web_ui_resource_url(&options.encrypt_secret, resource_url)),
         );
     }
 
@@ -1854,7 +2031,7 @@ mod tests {
                 resource_url,
                 "logo",
             ),
-            concat_path(&options.base_url, &obfuscate_text(&options.encrypt_secret, resource_url)),
+            concat_path(&options.base_url, &seal_web_ui_resource_url(&options.encrypt_secret, resource_url)),
         );
     }
 
@@ -1871,7 +2048,7 @@ mod tests {
                 resource_url,
                 "logo",
             ),
-            concat_path(&options.base_url, &obfuscate_text(&options.encrypt_secret, resource_url)),
+            concat_path(&options.base_url, &seal_web_ui_resource_url(&options.encrypt_secret, resource_url)),
         );
     }
 
