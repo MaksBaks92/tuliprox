@@ -1,8 +1,8 @@
 diff --git a/backend/app/src/api/api_utils/mod.rs b/backend/app/src/api/api_utils/mod.rs
-index ba56f1b7..35f3c0cb 100644
+index e5735ea2..663a3911 100644
 --- a/backend/app/src/api/api_utils/mod.rs
 +++ b/backend/app/src/api/api_utils/mod.rs
-@@ -4630,6 +4630,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+@@ -4694,6 +4694,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: false,
@@ -11,10 +11,10 @@ index ba56f1b7..35f3c0cb 100644
          priority: 0,
          soft_connections: 0,
 diff --git a/backend/app/src/api/api_utils/tests.rs b/backend/app/src/api/api_utils/tests.rs
-index 0298c9fb..9ca47273 100644
+index c77b824d..24c9ebd7 100644
 --- a/backend/app/src/api/api_utils/tests.rs
 +++ b/backend/app/src/api/api_utils/tests.rs
-@@ -9353,6 +9353,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
+@@ -9503,6 +9503,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
          status: None,
          output_clusters: ClusterFlags::all(),
          ui_enabled: true,
@@ -37,10 +37,10 @@ index 5a635221..4af6d296 100644
                          })
                          .count()
 diff --git a/backend/app/src/api/endpoints/m3u_api.rs b/backend/app/src/api/endpoints/m3u_api.rs
-index bdbb830c..fd67addd 100644
+index 39ed5544..8696ce1d 100644
 --- a/backend/app/src/api/endpoints/m3u_api.rs
 +++ b/backend/app/src/api/endpoints/m3u_api.rs
-@@ -614,8 +614,8 @@ fn resolve_loaded_m3u_catchup(
+@@ -624,8 +624,8 @@ fn resolve_loaded_m3u_catchup(
      Ok((catchup_item, resolved.discriminator))
  }
  
@@ -51,7 +51,7 @@ index bdbb830c..fd67addd 100644
  }
  
  #[allow(clippy::too_many_lines)]
-@@ -852,7 +852,7 @@ async fn m3u_api_catchup(
+@@ -862,7 +862,7 @@ async fn m3u_api_catchup(
              return axum::http::StatusCode::BAD_REQUEST.into_response();
          }
      };
@@ -60,7 +60,7 @@ index bdbb830c..fd67addd 100644
          return axum::http::StatusCode::FORBIDDEN.into_response();
      }
  
-@@ -1145,10 +1145,74 @@ mod tests {
+@@ -1155,10 +1155,74 @@ mod tests {
  
      #[test]
      fn resolved_catchup_item_requires_rechecked_permissions() {
@@ -265,7 +265,7 @@ index 0cae1b7f..ddaef5d5 100644
                      }
                      Err(err) => error!("Failed to parse json file {}: {err}", file_path.display()),
 diff --git a/backend/core/src/model/config/api_user.rs b/backend/core/src/model/config/api_user.rs
-index 60f59fcf..09ccf9e0 100644
+index 8a5cd10b..14d680c5 100644
 --- a/backend/core/src/model/config/api_user.rs
 +++ b/backend/core/src/model/config/api_user.rs
 @@ -106,6 +106,7 @@ pub struct ProxyUserCredentials {
@@ -292,7 +292,7 @@ index 60f59fcf..09ccf9e0 100644
              comment: instance.comment.clone(),
              priority: instance.priority,
              soft_connections: instance.raw_soft_connections,
-@@ -330,6 +333,48 @@ impl ProxyUserCredentials {
+@@ -338,6 +341,48 @@ impl ProxyUserCredentials {
      pub fn allows_item_type(&self, item_type: shared::model::PlaylistItemType) -> bool {
          self.output_clusters.has_cluster(item_type)
      }
@@ -341,7 +341,7 @@ index 60f59fcf..09ccf9e0 100644
  }
  
  impl Drop for ProxyUserCredentials {
-@@ -421,4 +466,40 @@ mod tests {
+@@ -457,4 +502,40 @@ mod tests {
          user2.resolve_plan(&plans);
          assert_eq!(user2.proxy, ProxyType::Reverse(Some(ClusterFlags::Vod)));
      }
@@ -1018,10 +1018,10 @@ index df930139..4102efe2 100644
          priority: 0,
          soft_connections,
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index 69071fd4..1b429313 100644
+index c747bf19..de645e99 100644
 --- a/frontend/public/assets/i18n/ar.json
 +++ b/frontend/public/assets/i18n/ar.json
-@@ -676,6 +676,7 @@
+@@ -678,6 +678,7 @@
        "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
        "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
        "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
@@ -1029,7 +1029,7 @@ index 69071fd4..1b429313 100644
        "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
      },
      "USER_PLAN": {
-@@ -1686,6 +1687,7 @@
+@@ -1691,6 +1692,7 @@
      "USER_STATUS_TRIAL": "تجريبي",
      "USER_UI": "واجهة المستخدم",
      "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
@@ -1038,10 +1038,10 @@ index 69071fd4..1b429313 100644
      "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
      "USE_OUTPUT": "استخدام المخرج",
 diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index 4374f8c4..b30c08b6 100644
+index e26affa8..ebe3ab73 100644
 --- a/frontend/public/assets/i18n/en.json
 +++ b/frontend/public/assets/i18n/en.json
-@@ -680,6 +680,7 @@
+@@ -682,6 +682,7 @@
        "STATUS": "The active or disabled state of the user proxy credential.",
        "TOKEN": "Unique API token that can be used instead of username/password.",
        "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
@@ -1049,7 +1049,7 @@ index 4374f8c4..b30c08b6 100644
        "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
      },
      "USER_PLAN": {
-@@ -1771,6 +1772,7 @@
+@@ -1776,6 +1777,7 @@
      "USER_STATUS_TRIAL": "Trial",
      "USER_UI": "User UI",
      "USER_UI_ENABLED": "User-UI Enabled",
@@ -1058,10 +1058,10 @@ index 4374f8c4..b30c08b6 100644
      "USE_MEMORY_CACHE": "Mem-Cache",
      "USE_OUTPUT": "Use output",
 diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index 5969d0af..4b12775f 100644
+index 8d6b5b23..a4073626 100644
 --- a/frontend/public/assets/i18n/ru.json
 +++ b/frontend/public/assets/i18n/ru.json
-@@ -639,6 +639,7 @@
+@@ -641,6 +641,7 @@
        "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
        "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
        "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
@@ -1069,7 +1069,7 @@ index 5969d0af..4b12775f 100644
        "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
      },
      "USER_PLAN": {
-@@ -1581,6 +1582,7 @@
+@@ -1586,6 +1587,7 @@
      "USER_STATUS_TRIAL": "Пробный",
      "USER_UI": "Пользовательский UI",
      "USER_UI_ENABLED": "User-UI включен",
@@ -1078,10 +1078,10 @@ index 5969d0af..4b12775f 100644
      "USE_MEMORY_CACHE": "Mem-кэш",
      "USE_OUTPUT": "Использовать вывод",
 diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-index 434b5c10..014c1efc 100644
+index e8730e9e..a2ee381d 100644
 --- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
 +++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-@@ -159,6 +159,7 @@ generate_form_reducer!(
+@@ -160,6 +160,7 @@ generate_form_reducer!(
          OutputClusters => output_clusters: Option<ClusterFlags>,
          ExpDate => exp_date: Option<i64>,
          UiEnabled => ui_enabled: bool,
@@ -1089,7 +1089,7 @@ index 434b5c10..014c1efc 100644
          EpgTimeshift => epg_timeshift: Option<String>,
          EpgRequestTimeshift => epg_request_timeshift: Option<String>,
          Comment => comment: Option<String>,
-@@ -302,6 +303,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+@@ -305,6 +306,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
                          user.status = Some(ProxyUserStatus::Active);
                          user.output_clusters = None;
                          user.ui_enabled = true;
@@ -1097,7 +1097,7 @@ index 434b5c10..014c1efc 100644
                          let now = Utc::now();
                          user.created_at = Some(now.timestamp());
                          let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
-@@ -720,6 +722,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+@@ -731,6 +733,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
              { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_TIMESHIFT"), epg_timeshift, UserFormAction::EpgTimeshift) }
              { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_REQUEST_TIMESHIFT"), epg_request_timeshift, UserFormAction::EpgRequestTimeshift) }
              { edit_field_bool!(form_state,  translate.t("LABEL.USER_UI_ENABLED"), ui_enabled, UserFormAction::UiEnabled) }
@@ -1106,7 +1106,7 @@ index 434b5c10..014c1efc 100644
              { edit_field_list_option!(allowed_countries, translate.t("LABEL.ALLOWED_COUNTRIES"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_COUNTRIES", translate.t("LABEL.ADD_COUNTRY"), create_country_tag) }
              { edit_field_list_option!(allowed_networks, translate.t("LABEL.ALLOWED_NETWORKS"), "PROXY_USER_CREDENTIALS.NETWORK_ACCESS_NETWORKS", translate.t("LABEL.ADD_NETWORK"), create_network_tag) }
 diff --git a/shared/src/model/config/api_user.rs b/shared/src/model/config/api_user.rs
-index 93ba95c1..4a49b94e 100644
+index c22ce695..ec1c188a 100644
 --- a/shared/src/model/config/api_user.rs
 +++ b/shared/src/model/config/api_user.rs
 @@ -1,5 +1,7 @@
@@ -1128,7 +1128,7 @@ index 93ba95c1..4a49b94e 100644
      #[serde(default, skip_serializing_if = "is_blank_optional_string")]
      pub comment: Option<String>,
      #[serde(default = "default_user_priority", skip_serializing_if = "is_default_user_priority")]
-@@ -149,6 +154,7 @@ impl Default for ProxyUserCredentialsDto {
+@@ -153,6 +158,7 @@ impl Default for ProxyUserCredentialsDto {
              status: None,
              output_clusters: None,
              ui_enabled: default_as_true(),
@@ -1136,7 +1136,7 @@ index 93ba95c1..4a49b94e 100644
              comment: None,
              priority: default_user_priority(),
              soft_connections: 0,
-@@ -290,4 +296,31 @@ mod tests {
+@@ -310,4 +316,31 @@ mod tests {
                  .is_some_and(|networks| networks.iter().any(|n| n == "192.168.1.0/24")));
          }
      }
@@ -1169,7 +1169,7 @@ index 93ba95c1..4a49b94e 100644
 +    }
  }
 diff --git a/Cargo.lock b/Cargo.lock
-index 211349c7..c42744e9 100644
+index 1be47de1..4c8274c7 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -4854,6 +4854,7 @@ dependencies = [
