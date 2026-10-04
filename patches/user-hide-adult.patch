@@ -1,8 +1,20 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b41e23f6..c336f191 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4871,6 +4871,7 @@ dependencies = [
+  "bytes",
+  "chrono",
+  "crc32fast",
++ "dashmap",
+  "env_logger",
+  "filetime",
+  "futures",
 diff --git a/backend/app/src/api/api_utils/mod.rs b/backend/app/src/api/api_utils/mod.rs
-index e5735ea2..663a3911 100644
+index e25ccfd5..a1dc613f 100644
 --- a/backend/app/src/api/api_utils/mod.rs
 +++ b/backend/app/src/api/api_utils/mod.rs
-@@ -4694,6 +4694,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+@@ -5156,6 +5156,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: false,
@@ -11,10 +23,10 @@ index e5735ea2..663a3911 100644
          priority: 0,
          soft_connections: 0,
 diff --git a/backend/app/src/api/api_utils/tests.rs b/backend/app/src/api/api_utils/tests.rs
-index c77b824d..24c9ebd7 100644
+index 1cc55164..988223dd 100644
 --- a/backend/app/src/api/api_utils/tests.rs
 +++ b/backend/app/src/api/api_utils/tests.rs
-@@ -9503,6 +9503,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
+@@ -9864,6 +9864,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
          status: None,
          output_clusters: ClusterFlags::all(),
          ui_enabled: true,
@@ -36,11 +48,27 @@ index 5a635221..4af6d296 100644
                              }
                          })
                          .count()
+diff --git a/backend/app/src/api/endpoints/hls_api/owner_token.rs b/backend/app/src/api/endpoints/hls_api/owner_token.rs
+index daee5c2f..5f8cdf1e 100644
+--- a/backend/app/src/api/endpoints/hls_api/owner_token.rs
++++ b/backend/app/src/api/endpoints/hls_api/owner_token.rs
+@@ -126,7 +126,10 @@ where
+         HlsEntryOutputScope::ItemType(item_type) => user.allows_item_type(item_type),
+         HlsEntryOutputScope::LiveCluster => user.allows_cluster(XtreamCluster::Live),
+     };
+-    output_allowed && (user.t_filter.is_none() || user.allows_content(&shared::model::PlaylistItem::from(item)))
++    let pli = shared::model::PlaylistItem::from(item);
++    output_allowed
++        && (user.t_filter.is_none() || user.allows_content(&pli))
++        && user.allows_playlist_item(pli.header.group.as_ref(), pli.header.additional_properties.as_ref())
+ }
+ 
+ /// Checks that a sealed session token belongs to the requesting user, `virtual_id` and user agent.
 diff --git a/backend/app/src/api/endpoints/m3u_api.rs b/backend/app/src/api/endpoints/m3u_api.rs
-index 39ed5544..8696ce1d 100644
+index 05fc50d6..4e4e3f6b 100644
 --- a/backend/app/src/api/endpoints/m3u_api.rs
 +++ b/backend/app/src/api/endpoints/m3u_api.rs
-@@ -624,8 +624,8 @@ fn resolve_loaded_m3u_catchup(
+@@ -640,8 +640,8 @@ fn resolve_loaded_m3u_catchup(
      Ok((catchup_item, resolved.discriminator))
  }
  
@@ -51,7 +79,7 @@ index 39ed5544..8696ce1d 100644
  }
  
  #[allow(clippy::too_many_lines)]
-@@ -862,7 +862,7 @@ async fn m3u_api_catchup(
+@@ -881,7 +881,7 @@ async fn m3u_api_catchup(
              return axum::http::StatusCode::BAD_REQUEST.into_response();
          }
      };
@@ -60,7 +88,7 @@ index 39ed5544..8696ce1d 100644
          return axum::http::StatusCode::FORBIDDEN.into_response();
      }
  
-@@ -1155,10 +1155,74 @@ mod tests {
+@@ -1175,10 +1175,74 @@ mod tests {
  
      #[test]
      fn resolved_catchup_item_requires_rechecked_permissions() {
@@ -233,20 +261,20 @@ index 896164ba..1ea02198 100644
                  if !visible.contains(&channel.id.to_lowercase()) {
                      continue;
 diff --git a/backend/app/src/api/endpoints/xtream_api/mod.rs b/backend/app/src/api/endpoints/xtream_api/mod.rs
-index 0cae1b7f..ddaef5d5 100644
+index fc17e51e..57f3b782 100644
 --- a/backend/app/src/api/endpoints/xtream_api/mod.rs
 +++ b/backend/app/src/api/endpoints/xtream_api/mod.rs
-@@ -325,7 +325,8 @@ async fn xtream_player_api_stream(
+@@ -326,7 +326,8 @@ async fn xtream_player_api_stream(
      } else {
-         user.allows_item_type(pli.item_type)
-     }) && (user.t_filter.is_none()
--        || user.allows_content(&shared::model::PlaylistItem::from(&pli)));
-+        || user.allows_content(&shared::model::PlaylistItem::from(&pli)))
+         HlsEntryOutputScope::ItemType(pli.item_type)
+     };
+-    let output_allowed = user_allows_entry_content(&user, output_scope, &pli);
++    let output_allowed = user_allows_entry_content(&user, output_scope, &pli)
 +        && user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref());
      if !output_allowed {
          if is_hls_manifest_request {
              return hls_custom_video_manifest_response(
-@@ -1073,6 +1074,7 @@ async fn xtream_player_api_resource(
+@@ -1089,6 +1090,7 @@ async fn xtream_player_api_resource(
  
      if !user.allows_item_type(pli.item_type)
          || !(user.t_filter.is_none() || user.allows_content(&shared::model::PlaylistItem::from(&pli)))
@@ -254,7 +282,7 @@ index 0cae1b7f..ddaef5d5 100644
      {
          return axum::http::StatusCode::NOT_FOUND.into_response();
      }
-@@ -1536,6 +1538,9 @@ async fn xtream_player_api_handle_content_action(
+@@ -1552,6 +1554,9 @@ async fn xtream_player_api_handle_content_action(
                          {
                              categories.retain(|c| c.category_id.parse::<u32>().is_ok_and(|id| visible.contains(&id)));
                          }
@@ -768,8 +796,60 @@ index 00000000..cc0cec17
 +        assert!(!epg_channel_hidden_by_adult_blocklist(&HashSet::new(), &"mix.case".intern()));
 +    }
 +}
+diff --git a/backend/repository/src/api_user_recovery.rs b/backend/repository/src/api_user_recovery.rs
+index 99c6feae..74dcb699 100644
+--- a/backend/repository/src/api_user_recovery.rs
++++ b/backend/repository/src/api_user_recovery.rs
+@@ -329,6 +329,7 @@ pub(crate) struct StoredApiUserV7 {
+     pub network_access: Option<NetworkAccessDto>,
+     pub plan: Option<String>,
+     pub filter: Option<String>,
++    pub hide_adult: bool,
+ }
+ 
+ impl StoredApiUserV7 {
+@@ -355,6 +356,7 @@ impl StoredApiUserV7 {
+             network_access: v6.network_access.clone(),
+             plan: None,
+             filter: None,
++            hide_adult: false,
+         }
+     }
+ 
+@@ -403,6 +405,7 @@ pub(crate) struct ApiUserRecovery {
+     pub network_access: Option<NetworkAccessDto>,
+     pub plan: Option<String>,
+     pub filter: Option<String>,
++    pub hide_adult: bool,
+ }
+ 
+ #[cfg(test)]
+@@ -430,6 +433,7 @@ impl From<&StoredApiUserV7> for ApiUserRecovery {
+             network_access: v7.network_access.clone(),
+             plan: v7.plan.clone(),
+             filter: v7.filter.clone(),
++            hide_adult: v7.hide_adult,
+         }
+     }
+ }
+@@ -458,6 +462,7 @@ impl From<&StoredProxyUserCredentials> for ApiUserRecovery {
+             network_access: stored.network_access.clone(),
+             plan: stored.plan.clone(),
+             filter: stored.filter.clone(),
++            hide_adult: stored.hide_adult,
+         }
+     }
+ }
+@@ -486,6 +491,7 @@ impl From<&ApiUserRecovery> for StoredProxyUserCredentials {
+             network_access: recovery.network_access.clone(),
+             plan: recovery.plan.clone(),
+             filter: recovery.filter.clone(),
++            hide_adult: recovery.hide_adult,
+         }
+     }
+ }
 diff --git a/backend/repository/src/lib.rs b/backend/repository/src/lib.rs
-index 2b382701..a64f1e83 100644
+index 75614616..056e2be6 100644
 --- a/backend/repository/src/lib.rs
 +++ b/backend/repository/src/lib.rs
 @@ -1,6 +1,7 @@
@@ -780,7 +860,7 @@ index 2b382701..a64f1e83 100644
  // A B+Tree-backed IPv4 lookup and a CLI dumper for the repository's databases.
  // Both read repository storage directly, so they belong here rather than in
  // `utils`, which must not depend on this layer.
-@@ -40,6 +41,7 @@ mod xtream_playlist_iterator;
+@@ -41,6 +42,7 @@ mod xtream_playlist_iterator;
  mod xtream_repository;
  
  pub use alias_repository::*;
@@ -817,10 +897,10 @@ index a1fda341..5fa11de5 100644
                      if !set.contains(item.group.as_ref()) {
                          continue;
 diff --git a/backend/repository/src/startup_migration.rs b/backend/repository/src/startup_migration.rs
-index b51f1e0a..4199cb43 100644
+index 51face15..cbc33a1b 100644
 --- a/backend/repository/src/startup_migration.rs
 +++ b/backend/repository/src/startup_migration.rs
-@@ -825,7 +825,7 @@ fn marker_file_name() -> String { format!("{MARKER_FILE_GUARD_PREFIX}{STORAGE_VE
+@@ -830,7 +830,7 @@ fn marker_file_name() -> String { format!("{MARKER_FILE_GUARD_PREFIX}{STORAGE_VE
  //   V4              – 17 fields, added soft_connections and soft_priority
  //   V5              – 18 fields, added output_clusters
  //   V6              – 19 fields, added network_access
@@ -829,23 +909,7 @@ index b51f1e0a..4199cb43 100644
  //
  // On first startup after an upgrade the file is still in an older format.
  // `migrate_user_db_schema` detects this, converts every record in-place, and
-@@ -1120,6 +1120,7 @@ struct StoredApiUserV7 {
-     pub status: Option<ProxyUserStatus>,
-     pub output_clusters: ClusterFlags,
-     pub ui_enabled: bool,
-+    pub hide_adult: bool,
-     pub comment: Option<String>,
-     pub priority: Option<i8>,
-     pub soft_connections: Option<u16>,
-@@ -1146,6 +1147,7 @@ impl StoredApiUserV7 {
-             status: v6.status,
-             output_clusters: v6.output_clusters,
-             ui_enabled: v6.ui_enabled,
-+            hide_adult: false,
-             comment: v6.comment.clone(),
-             priority: v6.priority,
-             soft_connections: v6.soft_connections,
-@@ -1805,6 +1807,7 @@ mod tests {
+@@ -1475,6 +1475,7 @@ mod tests {
          assert_eq!(user.username, "alice");
          assert_eq!(user.epg_request_timeshift.as_deref(), Some("2"));
          assert_eq!(user.output_clusters, ClusterFlags::all());
@@ -853,7 +917,7 @@ index b51f1e0a..4199cb43 100644
          assert_eq!(user.priority, None);
          assert_eq!(user.soft_connections, None);
          assert_eq!(user.soft_priority, None);
-@@ -1854,6 +1857,7 @@ mod tests {
+@@ -1524,6 +1525,7 @@ mod tests {
              .query(&"bob".to_string())
              .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bob missing after migration"))?;
          assert_eq!(user.output_clusters, ClusterFlags::all());
@@ -861,7 +925,7 @@ index b51f1e0a..4199cb43 100644
          assert_eq!(user.priority, Some(5));
          assert_eq!(user.soft_connections, None);
          assert_eq!(user.soft_priority, None);
-@@ -1904,6 +1908,7 @@ mod tests {
+@@ -1574,6 +1576,7 @@ mod tests {
              .query(&"carol".to_string())
              .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "carol missing after migration"))?;
          assert_eq!(user.output_clusters, ClusterFlags::all());
@@ -869,7 +933,7 @@ index b51f1e0a..4199cb43 100644
          assert_eq!(user.soft_connections, Some(2));
          assert_eq!(user.soft_priority, Some(-4));
          assert_eq!(user.network_access, None);
-@@ -1954,6 +1959,7 @@ mod tests {
+@@ -1624,6 +1627,7 @@ mod tests {
              .query(&"dave".to_string())
              .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "dave missing after v7 migration"))?;
          assert_eq!(user.output_clusters, ClusterFlags::Live | ClusterFlags::Vod);
@@ -877,7 +941,7 @@ index b51f1e0a..4199cb43 100644
          assert_eq!(user.priority, Some(5));
          assert_eq!(user.soft_connections, Some(2));
          assert_eq!(user.soft_priority, Some(-4));
-@@ -2011,6 +2017,7 @@ mod tests {
+@@ -1681,6 +1685,7 @@ mod tests {
              .query(&"erin".to_string())
              .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "erin missing after v7 migration"))?;
          assert_eq!(user.output_clusters, ClusterFlags::Live | ClusterFlags::Vod);
@@ -885,19 +949,19 @@ index b51f1e0a..4199cb43 100644
          assert_eq!(user.priority, Some(5));
          assert_eq!(user.soft_connections, Some(2));
          assert_eq!(user.soft_priority, Some(-4));
-@@ -2048,6 +2055,7 @@ mod tests {
-                 status: Some(ProxyUserStatus::Active),
-                 output_clusters: ClusterFlags::all(),
-                 ui_enabled: true,
-+                hide_adult: true,
-                 comment: None,
-                 priority: None,
-                 soft_connections: None,
+@@ -1725,6 +1730,7 @@ mod tests {
+                 network_access: None,
+                 plan: Some("basic".to_string()),
+                 filter: Some(r#"Group ~ "^DE.*""#.to_string()),
++                hide_adult: false,
+             },
+         );
+         let _ = v7_tree.store(&db_path)?;
 diff --git a/backend/repository/src/user_repository.rs b/backend/repository/src/user_repository.rs
-index bdd1e506..4e8fb4a1 100644
+index 9c8a044e..21295f05 100644
 --- a/backend/repository/src/user_repository.rs
 +++ b/backend/repository/src/user_repository.rs
-@@ -35,6 +35,7 @@ struct StoredProxyUserCredentials {
+@@ -35,6 +35,7 @@ pub(crate) struct StoredProxyUserCredentials {
      pub status: Option<ProxyUserStatus>,
      pub output_clusters: ClusterFlags,
      pub ui_enabled: bool,
@@ -921,7 +985,7 @@ index bdd1e506..4e8fb4a1 100644
              comment: stored.comment.clone(),
              priority: stored.priority.unwrap_or(0),
              soft_connections: raw_soft_connections,
-@@ -552,6 +555,7 @@ mod tests {
+@@ -613,6 +616,7 @@ mod tests {
              status: Some(status),
              output_clusters: ClusterFlags::all(),
              ui_enabled: true,
@@ -1006,10 +1070,10 @@ index 4e3841f9..5133147a 100644
  
      #[tokio::test]
 diff --git a/backend/session/src/active_user_manager/tests.rs b/backend/session/src/active_user_manager/tests.rs
-index df930139..4102efe2 100644
+index d56ae619..8b4bd7e8 100644
 --- a/backend/session/src/active_user_manager/tests.rs
 +++ b/backend/session/src/active_user_manager/tests.rs
-@@ -1230,6 +1230,7 @@ fn test_user_credentials(username: &str, max_connections: u32, soft_connections:
+@@ -1235,6 +1235,7 @@ fn test_user_credentials(username: &str, max_connections: u32, soft_connections:
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: true,
@@ -1018,10 +1082,10 @@ index df930139..4102efe2 100644
          priority: 0,
          soft_connections,
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index c747bf19..de645e99 100644
+index 90fb5e6a..12ac7eb3 100644
 --- a/frontend/public/assets/i18n/ar.json
 +++ b/frontend/public/assets/i18n/ar.json
-@@ -678,6 +678,7 @@
+@@ -683,6 +683,7 @@
        "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
        "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
        "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
@@ -1029,7 +1093,7 @@ index c747bf19..de645e99 100644
        "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
      },
      "USER_PLAN": {
-@@ -1691,6 +1692,7 @@
+@@ -1711,6 +1712,7 @@
      "USER_STATUS_TRIAL": "تجريبي",
      "USER_UI": "واجهة المستخدم",
      "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
@@ -1038,10 +1102,10 @@ index c747bf19..de645e99 100644
      "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
      "USE_OUTPUT": "استخدام المخرج",
 diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index e26affa8..ebe3ab73 100644
+index 50b1f88e..b9c0eae8 100644
 --- a/frontend/public/assets/i18n/en.json
 +++ b/frontend/public/assets/i18n/en.json
-@@ -682,6 +682,7 @@
+@@ -683,6 +683,7 @@
        "STATUS": "The active or disabled state of the user proxy credential.",
        "TOKEN": "Unique API token that can be used instead of username/password.",
        "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
@@ -1049,7 +1113,7 @@ index e26affa8..ebe3ab73 100644
        "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
      },
      "USER_PLAN": {
-@@ -1776,6 +1777,7 @@
+@@ -1779,6 +1780,7 @@
      "USER_STATUS_TRIAL": "Trial",
      "USER_UI": "User UI",
      "USER_UI_ENABLED": "User-UI Enabled",
@@ -1058,10 +1122,10 @@ index e26affa8..ebe3ab73 100644
      "USE_MEMORY_CACHE": "Mem-Cache",
      "USE_OUTPUT": "Use output",
 diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index 8d6b5b23..a4073626 100644
+index 02c5231a..ac13e0a1 100644
 --- a/frontend/public/assets/i18n/ru.json
 +++ b/frontend/public/assets/i18n/ru.json
-@@ -641,6 +641,7 @@
+@@ -683,6 +683,7 @@
        "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
        "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
        "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
@@ -1069,7 +1133,7 @@ index 8d6b5b23..a4073626 100644
        "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
      },
      "USER_PLAN": {
-@@ -1586,6 +1587,7 @@
+@@ -1697,6 +1698,7 @@
      "USER_STATUS_TRIAL": "Пробный",
      "USER_UI": "Пользовательский UI",
      "USER_UI_ENABLED": "User-UI включен",
@@ -1168,15 +1232,3 @@ index c22ce695..ec1c188a 100644
 +        assert!(!user.hide_adult);
 +    }
  }
-diff --git a/Cargo.lock b/Cargo.lock
-index f6d05e56..2082f01e 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -4854,6 +4854,7 @@ dependencies = [
-  "bytes",
-  "chrono",
-  "crc32fast",
-+ "dashmap",
-  "env_logger",
-  "filetime",
-  "futures",
