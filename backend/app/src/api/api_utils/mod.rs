@@ -4,7 +4,10 @@ pub use crate::repository::{
 };
 use crate::{
     api::{
-        endpoints::xtream_api::{get_xtream_player_api_stream_url, ApiStreamContext},
+        endpoints::{
+            hls_api::{hls_media_playlist_wrap_enabled, wrap_media_playlist, HlsMediaPlaylistWrap},
+            xtream_api::{get_xtream_player_api_stream_url, ApiStreamContext},
+        },
         model::{
             create_active_client_stream, create_channel_unavailable_stream, create_custom_video_stream_response,
             create_provider_connections_exhausted_stream, get_custom_stream_response_error_status,
@@ -29,7 +32,7 @@ use crate::{
         AppConfig, ConfigInput, ConfigInputFlags, ConfigTarget, InputUserInfo, PlaybackKind, ProxyUserCredentials,
     },
     processing::{
-        parser::hls::{rewrite_hls, RewriteHlsProps},
+        parser::hls::{classify_hls_playlist, rewrite_hls, HlsPlaylistKind, RewriteHlsProps},
         processor::re_resolve_stalker_url,
     },
     repository::load_input_m3u_stream_url,
@@ -343,8 +346,9 @@ pub(crate) use tuliprox_session::{
         resolve_playback_request_admission, AdmissionRequest, EvictionReentryGuard, PlaybackRequestClass,
         PlaybackRequestFacts,
     },
-    stream_options::{get_stream_options, StreamOptions},
+    stream_options::{get_stream_options, StreamOptions, StreamResponseMode},
 };
+use tuliprox_session::{ProviderSessionHeaders, SessionProviderHeaders};
 
 pub fn get_server_time() -> String {
     chrono::offset::Local::now().with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S %Z").to_string()
@@ -472,6 +476,7 @@ struct StreamingAcquireOptions<'a> {
     session_owner: Option<&'a str>,
     playback_kind: PlaybackKind,
     accept_requested_stream_url: bool,
+    capacity_wait_timeout: Option<Duration>,
 }
 
 pub struct ForceStreamRequestContext<'a> {
@@ -1245,6 +1250,112 @@ fn create_unmapped_provider_stream(app_config: &AppConfig) -> ProviderStreamStat
     }
 }
 
+/// Splits a provider open into stream, response info and session headers. An upstream error
+/// of a finite HLS resource carries no stream, only its status and forwarded headers.
+fn split_provider_stream_open(
+    open: crate::api::model::ProviderStreamOpen,
+) -> (Option<BoxedProviderStream>, ProviderStreamInfo, ProviderSessionHeaders) {
+    match open {
+        crate::api::model::ProviderStreamOpen::Stream(response) => {
+            (Some(response.stream), response.info, response.provider_session_headers)
+        }
+        crate::api::model::ProviderStreamOpen::UpstreamStatus { status, headers } => {
+            (None, Some((headers, status, None, None)), ProviderSessionHeaders::default())
+        }
+    }
+}
+
+/// Session and account binding a forced resource request must still belong to after acquiring capacity.
+#[derive(Clone, Copy)]
+struct CurrentSessionGuard<'a> {
+    username: &'a str,
+    token: &'a str,
+    identity: tuliprox_session::SessionIdentity,
+}
+
+/// Upper bound a manifest refresh waits for its pinned account to free a slot. Parallel
+/// playbacks on one account free their slots within seconds; a 503 would stall the player.
+pub(crate) const HLS_MANIFEST_CAPACITY_WAIT: Duration = Duration::from_secs(5);
+/// Upper bound a media object (segment, init, key) waits. It stays well below a typical
+/// segment duration, so the player keeps buffer to retry after a 503.
+const HLS_MEDIA_CAPACITY_WAIT: Duration = Duration::from_secs(2);
+/// Lower bound between two acquisition attempts that only wait for a lease to expire.
+const LEASE_EXPIRY_RECHECK_FLOOR: Duration = Duration::from_millis(10);
+
+/// Acquisition of a slot on exactly one provider account for a playback lease.
+pub(crate) struct ExactProviderAcquire<'a> {
+    pub provider: &'a Arc<str>,
+    pub addr: &'a SocketAddr,
+    pub allow_grace: bool,
+    pub priority: i8,
+    pub kind: crate::api::model::ConnectionKind,
+    pub lease: Option<PlaybackLeaseRef<'a>>,
+}
+
+/// Acquires a slot on exactly `request.provider`, waiting at most `capacity_wait` for one to
+/// free up. Only slot and lease releases of this provider wake the waiter; reserved capacity
+/// held by idle leases is retried when the next lease expires.
+pub(crate) async fn acquire_exact_provider_handle(
+    app_state: &Arc<AppState>,
+    request: &ExactProviderAcquire<'_>,
+    capacity_wait: Option<Duration>,
+) -> Option<crate::api::model::ProviderHandle> {
+    let deadline = capacity_wait.map(|wait| tokio::time::Instant::now() + wait);
+    let acquire = || {
+        app_state.active_provider.acquire_exact_connection_with_lease_for_session_until(
+            request.provider,
+            request.addr,
+            request.allow_grace,
+            request.priority,
+            request.kind,
+            request.lease,
+            deadline,
+        )
+    };
+    let Some(deadline) = deadline else {
+        return acquire().await;
+    };
+    let capacity_notify = app_state.active_provider.provider_capacity_notify(request.provider);
+    loop {
+        let notified = capacity_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if app_state.connection_manager.is_shutting_down() || tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        if let Some(handle) = acquire().await {
+            return Some(handle);
+        }
+        let earliest_retry = tokio::time::Instant::now() + LEASE_EXPIRY_RECHECK_FLOOR;
+        let wake_at = app_state
+            .active_provider
+            .next_lease_expiry()
+            .map_or(deadline, |expiry| expiry.max(earliest_retry).min(deadline));
+        tokio::select! {
+            () = tokio::time::sleep_until(wake_at) => {},
+            () = &mut notified => {},
+        }
+    }
+}
+
+/// Waits for finite resources to release capacity without superseding an active body.
+async fn acquire_exact_stream_provider_handle(
+    app_state: &Arc<AppState>,
+    provider: &Arc<str>,
+    fingerprint: &Fingerprint,
+    options: &StreamingAcquireOptions<'_>,
+) -> Option<crate::api::model::ProviderHandle> {
+    let request = ExactProviderAcquire {
+        provider,
+        addr: &fingerprint.addr,
+        allow_grace: options.allow_provider_grace,
+        priority: options.user_priority,
+        kind: options.connection_kind,
+        lease: options.session_owner.map(|owner| PlaybackLeaseRef::new(owner, options.playback_kind)),
+    };
+    acquire_exact_provider_handle(app_state, &request, options.capacity_wait_timeout).await
+}
+
 async fn acquire_stream_provider_handle(
     app_state: &Arc<AppState>,
     input: &ConfigInput,
@@ -1256,17 +1367,7 @@ async fn acquire_stream_provider_handle(
     match options.force_provider {
         Some(provider) => {
             // First try to stay on the exact pinned provider account without over-allocating.
-            if let Some(handle) = app_state
-                .active_provider
-                .acquire_exact_connection_with_lease_for_session_await(
-                    provider,
-                    &fingerprint.addr,
-                    options.allow_provider_grace,
-                    options.user_priority,
-                    options.connection_kind,
-                    lease,
-                )
-                .await
+            if let Some(handle) = acquire_exact_stream_provider_handle(app_state, provider, fingerprint, options).await
             {
                 Some(managed(handle))
             } else if options.allow_forced_provider_fallback {
@@ -1309,6 +1410,18 @@ async fn acquire_stream_provider_handle(
             .await
             .map(managed),
     }
+}
+
+fn allows_provider_pool_failover(item_type: PlaylistItemType) -> bool {
+    matches!(
+        item_type,
+        PlaylistItemType::Video
+            | PlaylistItemType::LocalVideo
+            | PlaylistItemType::Series
+            | PlaylistItemType::SeriesInfo
+            | PlaylistItemType::LocalSeries
+            | PlaylistItemType::LocalSeriesInfo
+    )
 }
 
 pub(crate) fn resolve_redirect_location<'a>(
@@ -1355,6 +1468,7 @@ fn get_redirect_alternative_url(app_state: &Arc<AppState>, redirect_url: &Arc<st
 /// - and optional HTTP headers to include in the request.
 ///
 /// This logic helps abstract the decision-making behind provider selection and stream URL resolution.
+#[cfg(test)]
 async fn resolve_streaming_strategy(
     app_state: &Arc<AppState>,
     stream_url: &str,
@@ -1363,7 +1477,33 @@ async fn resolve_streaming_strategy(
     options: StreamingAcquireOptions<'_>,
     stream_channel: Option<&StreamChannel>,
 ) -> StreamingStrategy {
-    let mut provider_connection_handle = acquire_stream_provider_handle(app_state, input, fingerprint, &options).await;
+    resolve_streaming_strategy_with_provider_handle(
+        app_state,
+        stream_url,
+        fingerprint,
+        input,
+        options,
+        stream_channel,
+        None,
+    )
+    .await
+}
+
+async fn resolve_streaming_strategy_with_provider_handle(
+    app_state: &Arc<AppState>,
+    stream_url: &str,
+    fingerprint: &Fingerprint,
+    input: &ConfigInput,
+    options: StreamingAcquireOptions<'_>,
+    stream_channel: Option<&StreamChannel>,
+    preacquired_provider_handle: Option<tuliprox_session::ManagedProviderHandle>,
+) -> StreamingStrategy {
+    // Recording requests transfer the slot acquired by the worker into this
+    // provider-body owner. Normal playback allocates here as before.
+    let mut provider_connection_handle = match preacquired_provider_handle {
+        Some(handle) => Some(handle),
+        None => acquire_stream_provider_handle(app_state, input, fingerprint, &options).await,
+    };
 
     // panel_api provisioning/loading is handled later in the stream creation flow
 
@@ -1517,7 +1657,7 @@ async fn re_resolve_stalker_url_singleflight(
 ) -> Result<Option<Arc<str>>, TuliproxError> {
     let entry_lock = app_state.stalker_resolve_coordinator.guard_for(input.id, provider_id).await;
     let _flight = entry_lock.lock().await;
-    let client = app_state.http_client.load().as_ref().clone();
+    let client = app_state.http_clients.default.load().as_ref().clone();
     re_resolve_stalker_url(&app_state.app_config, &client, input, provider_id, kind, force_refresh).await
 }
 
@@ -1590,8 +1730,10 @@ async fn create_stream_response_details(
     accept_requested_stream_url: bool,
     grace_hold_override: Option<bool>,
     grace_resolution_context: Option<crate::api::model::GraceResolutionContext>,
+    current_session: Option<CurrentSessionGuard<'_>>,
+    preacquired_provider_handle: Option<tuliprox_session::ManagedProviderHandle>,
 ) -> Result<StreamDetails, TuliproxError> {
-    let mut streaming_strategy = resolve_streaming_strategy(
+    let mut streaming_strategy = resolve_streaming_strategy_with_provider_handle(
         app_state,
         stream_url,
         fingerprint,
@@ -1605,10 +1747,36 @@ async fn create_stream_response_details(
             session_owner,
             playback_kind: PlaybackKind::classify(item_type, extract_extension_from_url(stream_url)),
             accept_requested_stream_url,
+            capacity_wait_timeout: (stream_options.response_mode == StreamResponseMode::HlsResource)
+                .then_some(HLS_MEDIA_CAPACITY_WAIT),
         },
         Some(stream_channel),
+        preacquired_provider_handle,
     )
     .await;
+    // A capacity wait can outlive the session snapshot: revalidate the account binding and
+    // read the cookies valid now, before any upstream request is sent.
+    let current_session_headers;
+    let session_headers = match current_session {
+        Some(guard) => {
+            match app_state
+                .active_users
+                .current_session_provider_headers(guard.username, guard.token, guard.identity, stream_url)
+                .await
+            {
+                SessionProviderHeaders::NoSession => {
+                    app_state
+                        .connection_manager
+                        .release_managed_provider_handle(streaming_strategy.provider_handle.take());
+                    return Err(TuliproxError::Errors("playback session ended or switched provider account"));
+                }
+                SessionProviderHeaders::NoHeaders => current_session_headers = None,
+                SessionProviderHeaders::Headers(headers) => current_session_headers = Some(headers),
+            }
+            current_session_headers.as_ref()
+        }
+        None => session_headers,
+    };
     let user_agent_stream_index = resolve_stream_user_agent_index(
         app_state,
         input,
@@ -1673,7 +1841,7 @@ async fn create_stream_response_details(
                 provider_name: Some(provider_name),
                 request_url: None,
                 session_headers: session_headers.cloned(),
-                provider_session_headers: HashMap::new(),
+                provider_session_headers: ProviderSessionHeaders::default(),
                 user_agent_stream_index,
                 grace_period: grace_period_options,
                 provider_grace_active: false,
@@ -1683,6 +1851,8 @@ async fn create_stream_response_details(
                 content_representation,
                 grace_resolution_context,
                 custom_reason: Some(reason),
+                response_mode: stream_options.response_mode,
+                session_registration: None,
             })
         }
         ProviderStreamState::Available(_provider_name, request_url)
@@ -1716,14 +1886,16 @@ async fn create_stream_response_details(
                         "Deferring provider stream open until grace check completes for {}",
                         sanitize_sensitive_info(resolve_request_url_for_logging(input, request_url.as_ref()).as_ref())
                     );
-                    (None, None, HashMap::new(), None)
+                    (None, None, ProviderSessionHeaders::default(), None)
                 } else if is_media_server_stream_ref_url(request_url.as_ref()) {
                     match open_media_server_stream_for_input(app_state, input, request_url.as_ref(), req_headers).await
                     {
-                        Ok((stream, stream_info)) => (Some(stream), stream_info, HashMap::new(), None),
+                        Ok((stream, stream_info)) => {
+                            (Some(stream), stream_info, ProviderSessionHeaders::default(), None)
+                        }
                         Err(err) => {
                             error!("Can't open media-server stream: {err}");
-                            (None, None, HashMap::new(), None)
+                            (None, None, ProviderSessionHeaders::default(), None)
                         }
                     }
                 } else {
@@ -1758,6 +1930,7 @@ async fn create_stream_response_details(
 
                             let provider_config = input.get_resolve_provider(url.as_ref());
                             provider_stream_factory_options.set_provider(provider_config);
+                            provider_stream_factory_options.apply_input_options(input);
                             if input.input_type.is_stalker() {
                                 provider_stream_factory_options.require_public_destination();
                             }
@@ -1769,20 +1942,18 @@ async fn create_stream_response_details(
                                 .and_then(ProviderStreamOpenLifecycle::from_managed);
                             let provider_stream = match open_provider_stream_with_lifecycle(
                                 &app_state.provider_stream_ctx(),
-                                &app_state.http_client.load(),
+                                &app_state.http_clients.default.load(),
                                 provider_stream_factory_options,
                                 lifecycle,
                             )
                             .await
                             {
-                                None => (None, None, HashMap::new()),
-                                Some(response) => {
-                                    (Some(response.stream), response.info, response.provider_session_headers)
-                                }
+                                None => (None, None, ProviderSessionHeaders::default()),
+                                Some(open) => split_provider_stream_open(open),
                             };
                             (provider_stream, Some(reconnect_flag))
                         } else {
-                            ((None, None, HashMap::new()), None)
+                            ((None, None, ProviderSessionHeaders::default()), None)
                         };
                     let should_refresh_stalker = should_refresh_stalker_playback(
                         input.input_type,
@@ -1830,6 +2001,7 @@ async fn create_stream_response_details(
                                         options.apply_user_agent_stream_index(stream_index);
                                     }
                                     options.set_provider(input.get_resolve_provider(url.as_ref()));
+                                    options.apply_input_options(input);
                                     options.require_public_destination();
                                     if let Some(m) = streaming_strategy.provider_handle.as_mut() {
                                         let _ = m.renew_opening_tokens();
@@ -1841,15 +2013,14 @@ async fn create_stream_response_details(
                                         .and_then(ProviderStreamOpenLifecycle::from_managed);
                                     let retried = open_provider_stream_with_lifecycle(
                                         &app_state.provider_stream_ctx(),
-                                        &app_state.http_client.load(),
+                                        &app_state.http_clients.default.load(),
                                         options,
                                         retry_lifecycle,
                                     )
                                     .await;
-                                    if let Some(response) = retried {
-                                        stream = Some(response.stream);
-                                        stream_info = response.info;
-                                        provider_session_headers = response.provider_session_headers;
+                                    if let Some(open) = retried {
+                                        (stream, stream_info, provider_session_headers) =
+                                            split_provider_stream_open(open);
                                         reconnect_flag = Some(retry_reconnect_flag);
                                         request_url = refreshed_url;
                                     } else {
@@ -1897,7 +2068,13 @@ async fn create_stream_response_details(
                 // The managed owner releases the provider slot synchronously on drop;
                 // a failed open must not rely on a lossy cleanup message.
                 drop(streaming_strategy.provider_handle.take());
-                error!("Can't open stream {}", sanitize_sensitive_info(&request_url));
+                match stream_info.as_ref() {
+                    // Finite HLS resources hand routine upstream errors (e.g. live-edge 404) to the client.
+                    Some((_, status, _, None)) if stream.is_none() && !status.is_success() => {
+                        debug!("Provider answered {status} for {}", sanitize_sensitive_info(&request_url));
+                    }
+                    _ => error!("Can't open stream {}", sanitize_sensitive_info(&request_url)),
+                }
                 None
             } else {
                 streaming_strategy.provider_handle.take()
@@ -1920,6 +2097,8 @@ async fn create_stream_response_details(
                 content_representation,
                 grace_resolution_context,
                 custom_reason: None,
+                response_mode: stream_options.response_mode,
+                session_registration: None,
             })
         }
     }
@@ -2104,7 +2283,7 @@ async fn open_media_server_stream_for_input(
 ) -> Result<(BoxedProviderStream, ProviderStreamInfo), MediaServerError> {
     let stream_ref = parse_media_server_stream_ref(&input.name, stream_url)?;
     let range = req_headers.get(header::RANGE).and_then(|value| value.to_str().ok());
-    let http_client = MediaServerHttpClient::new(app_state.http_client.load().as_ref().clone());
+    let http_client = MediaServerHttpClient::new(app_state.http_clients.default.load().as_ref().clone());
 
     let response = match input.input_type {
         InputType::Plex => {
@@ -2174,19 +2353,108 @@ fn no_custom_video_fallback_status(app_config: &AppConfig) -> StatusCode {
     }
 }
 
-/// # Panics
-#[allow(clippy::too_many_lines)]
 pub async fn force_provider_stream_response(
+    fingerprint: &Fingerprint,
+    app_state: &Arc<AppState>,
+    user_session: &UserSession,
+    stream_channel: StreamChannel,
+    ctx: ForceStreamRequestContext<'_>,
+    grace_mode: Option<crate::api::model::GraceMode>,
+) -> axum::response::Response {
+    force_stream_response(
+        fingerprint,
+        app_state,
+        user_session,
+        stream_channel,
+        ctx,
+        grace_mode,
+        StreamResponseMode::Stream,
+    )
+    .await
+}
+
+pub(crate) async fn force_hls_resource_response(
+    fingerprint: &Fingerprint,
+    app_state: &Arc<AppState>,
+    user_session: &UserSession,
+    stream_channel: StreamChannel,
+    mut ctx: ForceStreamRequestContext<'_>,
+    grace_mode: Option<crate::api::model::GraceMode>,
+) -> axum::response::Response {
+    // `resolve_stream_channel` classified the item with `hls_playback_kind`, like the manifest paths.
+    let kind = if stream_channel.item_type == PlaylistItemType::Catchup {
+        PlaybackKind::Catchup
+    } else {
+        PlaybackKind::LiveHls
+    };
+    ctx.session_reservation_ttl_secs = get_hls_playback_ttl_secs(app_state, kind);
+    force_stream_response(
+        fingerprint,
+        app_state,
+        user_session,
+        stream_channel,
+        ctx,
+        grace_mode,
+        StreamResponseMode::HlsResource,
+    )
+    .await
+}
+
+/// Status a finite HLS resource answers with instead of a fallback body, or `None` on success.
+fn hls_resource_failure_status(stream_details: &StreamDetails) -> Option<StatusCode> {
+    match stream_details.stream_info.as_ref() {
+        Some((_, status, _, _)) if !status.is_success() => Some(*status),
+        Some((_, _, _, Some(_))) => Some(StatusCode::SERVICE_UNAVAILABLE),
+        _ if stream_details.custom_reason.is_some() => Some(StatusCode::SERVICE_UNAVAILABLE),
+        _ if !stream_details.has_stream() => Some(StatusCode::BAD_GATEWAY),
+        _ => None,
+    }
+}
+
+/// Answers a failed finite HLS resource with its status and the forwarded upstream headers.
+/// Its provider slot is freed and an entry reservation no body ever used is released; a session
+/// that streams elsewhere keeps its reservation (see `release_unbound_session_reservation`).
+async fn reject_hls_resource(
+    app_state: &Arc<AppState>,
+    username: &str,
+    session_token: &str,
+    stream_details: StreamDetails,
+    status: StatusCode,
+) -> axum::response::Response {
+    let StreamDetails { provider_handle, stream_info, .. } = stream_details;
+    app_state.connection_manager.release_managed_provider_handle(provider_handle);
+    app_state.active_users.release_unbound_session_reservation(username, session_token, None, false).await;
+    let mut response = status.into_response();
+    if let Some((headers, _, _, None)) = stream_info {
+        for (name, value) in headers {
+            if let (Ok(name), Ok(value)) = (HeaderName::try_from(name), HeaderValue::try_from(value)) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+    }
+    response
+}
+
+#[allow(clippy::too_many_lines)]
+async fn force_stream_response(
     fingerprint: &Fingerprint,
     app_state: &Arc<AppState>,
     user_session: &UserSession,
     mut stream_channel: StreamChannel,
     ctx: ForceStreamRequestContext<'_>,
     grace_mode: Option<crate::api::model::GraceMode>,
-) -> impl IntoResponse + Send {
-    let _transition_guard =
-        app_state.active_users.acquire_playback_transition(&ctx.user.username, &user_session.token).await;
-    let stream_options = get_stream_options(&app_state.app_config);
+    response_mode: StreamResponseMode,
+) -> axum::response::Response {
+    let hls_resource = response_mode == StreamResponseMode::HlsResource;
+    // Finite HLS resources stay pinned to the session account and never rebind or clean up
+    // other sockets, so they skip the session transition gate. Holding it across the
+    // capacity wait would serialize parallel audio and video rendition requests.
+    let _transition_guard = if hls_resource {
+        None
+    } else {
+        Some(app_state.active_users.acquire_playback_transition(&ctx.user.username, &user_session.token).await)
+    };
+    let stream_options = get_stream_options(&app_state.app_config, response_mode);
     let share_stream = false;
     let connection_permission = UserConnectionPermission::Allowed;
     let item_type = stream_channel.item_type;
@@ -2194,7 +2462,9 @@ pub async fn force_provider_stream_response(
     // Forced reopens must clear stale provider slots before reacquiring. For adaptive HLS/DASH
     // and Catchup sessions we only target old active stream sockets of the same session, never
     // manifest-only session addresses, otherwise the controlling playlist request gets torn down.
-    let cleanup_addrs = if item_type.is_live_adaptive() || item_type == PlaylistItemType::Catchup {
+    let cleanup_addrs = if hls_resource {
+        Vec::new()
+    } else if item_type.is_live_adaptive() || item_type == PlaylistItemType::Catchup {
         app_state
             .active_users
             .adaptive_session_stream_cleanup_addrs(&ctx.user.username, &user_session.token, &fingerprint.addr)
@@ -2219,20 +2489,33 @@ pub async fn force_provider_stream_response(
         cleanup_forced_reopen_addrs(app_state, &user_session.token, &cleanup_addrs).await;
     }
 
-    // A provider stays preferred after real media flows or while its allocation is active.
-    // A start that produced no media may choose another alias on its next request.
-    // An exhausted preferred account can still fall back to the lineup.
-    let preferred_provider = (item_type.is_live()
+    // HLS child URLs remain bound to the manifest account before the first media byte.
+    // Other streams prefer the account after media starts or while its allocation is active,
+    // and can fall back to the lineup when that account is exhausted.
+    let preferred_provider = (hls_resource
+        || item_type.is_live()
         || user_session.media_started.load(std::sync::atomic::Ordering::Acquire)
         || app_state.active_provider.should_reuse_playback_provider(&user_session.token, &user_session.provider))
     .then_some(&user_session.provider);
-    let allow_forced_provider_fallback = true;
+    // Child URLs and their signed tokens belong to the account that fetched the playlist.
+    let allow_forced_provider_fallback =
+        !hls_resource && (!item_type.requires_provider_affinity() || allows_provider_pool_failover(item_type));
     // Never allow provider-side grace for forced seek/session reacquire.
     // Over-allocation here would break provider-side one-connection limits.
     let allow_provider_grace = false;
     let connection_kind = user_session.connection_kind.unwrap_or(crate::api::model::ConnectionKind::Normal);
 
-    let stream_details = match create_stream_response_details(
+    let session_identity = user_session.identity();
+    let current_session = hls_resource.then_some(CurrentSessionGuard {
+        username: &ctx.user.username,
+        token: &user_session.token,
+        identity: session_identity,
+    });
+    // Finite resources read their cookies after the capacity wait instead of from this snapshot.
+    let provider_session_headers = preferred_provider
+        .filter(|_| !hls_resource)
+        .and_then(|_| user_session.provider_session_headers_for(&user_session.stream_url));
+    let create_details = create_stream_response_details(
         app_state,
         &stream_options,
         &user_session.stream_url,
@@ -2253,15 +2536,37 @@ pub async fn force_provider_stream_response(
         connection_kind,
         true,
         Some(user_session.token.as_str()),
-        preferred_provider.map(|_| &user_session.provider_session_headers),
-        preferred_provider.is_some(),
+        provider_session_headers.as_deref(),
+        hls_resource || preferred_provider.is_some(),
         grace_mode.map(|mode| matches!(mode, crate::api::model::GraceMode::Hold)),
         None,
-    )
-    .await
-    {
+        current_session,
+        None,
+    );
+    // The FORBIDDEN exits below leave the session reservation alone: they only fire once this
+    // session identity is gone, and after an account switch the reservation belongs to the new
+    // binding. Dropping the cancelled future frees any provider slot it held.
+    let details_result = if hls_resource {
+        tokio::select! {
+            result = create_details => result,
+            () = app_state.active_users.wait_for_playback_session_end(
+                &ctx.user.username, &user_session.token, session_identity,
+            ) => return StatusCode::FORBIDDEN.into_response(),
+        }
+    } else {
+        create_details.await
+    };
+    let mut stream_details = match details_result {
         Ok(stream_details) => stream_details,
         Err(err) => {
+            if hls_resource
+                && !app_state
+                    .active_users
+                    .playback_session_is_current(&ctx.user.username, &user_session.token, session_identity)
+                    .await
+            {
+                return StatusCode::FORBIDDEN.into_response();
+            }
             app_state
                 .active_users
                 .release_unbound_session_reservation(&ctx.user.username, &user_session.token, None, false)
@@ -2271,9 +2576,31 @@ pub async fn force_provider_stream_response(
         }
     };
 
+    if hls_resource {
+        if !app_state
+            .active_users
+            .playback_session_is_current(&ctx.user.username, &user_session.token, session_identity)
+            .await
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        stream_details.session_registration = Some(tuliprox_session::PlaybackSessionRegistration {
+            identity: session_identity,
+            enforce_limits: app_state.app_config.config.load().user_access_control,
+            grace_admitted: user_session.permission == UserConnectionPermission::GracePeriod,
+        });
+        if let Some(status) = hls_resource_failure_status(&stream_details) {
+            return reject_hls_resource(app_state, &ctx.user.username, &user_session.token, stream_details, status)
+                .await;
+        }
+    }
+
     let deferred_grace_hold_stream = stream_details.has_deferred_provider_open();
 
     if stream_details.has_stream() || deferred_grace_hold_stream {
+        let selected_provider = stream_details.provider_name.clone();
+        let selected_request_url = stream_details.request_url.clone();
+        let selected_provider_headers = stream_details.provider_session_headers.clone();
         let metering = prepare_stream_metering(
             app_state,
             user_session.stream_url.as_ref(),
@@ -2306,23 +2633,36 @@ pub async fn force_provider_stream_response(
                         new_stream_url,
                     )
                     .await;
-                app_state
-                    .active_users
-                    .update_session_provider_headers(
-                        &ctx.user.username,
-                        &user_session.token,
-                        &stream_details.provider_session_headers,
-                    )
-                    .await;
-            } else if !stream_details.provider_session_headers.is_empty() {
-                app_state
-                    .active_users
-                    .update_session_provider_headers(
-                        &ctx.user.username,
-                        &user_session.token,
-                        &stream_details.provider_session_headers,
-                    )
-                    .await;
+            }
+            if allocated_provider.as_ref() != user_session.provider.as_ref()
+                || !stream_details.provider_session_headers.is_empty()
+            {
+                let cookie_origin = provider_response
+                    .as_ref()
+                    .and_then(|(_, _, url, _)| url.as_ref())
+                    .map_or(user_session.stream_url.as_ref(), Url::as_str);
+                let active_users = &app_state.active_users;
+                if hls_resource {
+                    // Cookies from the previous account never enter a jar after an account switch.
+                    active_users
+                        .update_current_session_provider_response_headers_from(
+                            &ctx.user.username,
+                            &user_session.token,
+                            session_identity,
+                            &stream_details.provider_session_headers,
+                            cookie_origin,
+                        )
+                        .await;
+                } else {
+                    active_users
+                        .update_session_provider_response_headers_from(
+                            &ctx.user.username,
+                            &user_session.token,
+                            &stream_details.provider_session_headers,
+                            cookie_origin,
+                        )
+                        .await;
+                }
             }
         }
         app_state.active_users.update_session_addr(&ctx.user.username, &user_session.token, &fingerprint.addr).await;
@@ -2353,6 +2693,37 @@ pub async fn force_provider_stream_response(
                 return stream_admission_rejected_response(error, &ctx.user.username);
             }
         };
+
+        if let Some(provider) = selected_provider.as_deref() {
+            let session_url = selected_request_url.as_deref().unwrap_or(user_session.stream_url.as_ref());
+            app_state
+                .active_users
+                .create_user_session(crate::api::model::CreateUserSessionParams {
+                    user: ctx.user,
+                    session_token: &user_session.token,
+                    virtual_id: user_session.virtual_id,
+                    provider,
+                    stream_url: session_url,
+                    addr: &fingerprint.addr,
+                    connection_permission,
+                    connection_kind: user_session.connection_kind,
+                    socket_bound: user_session.socket_bound,
+                })
+                .await;
+            if !selected_provider_headers.is_empty() {
+                let cookie_origin =
+                    provider_response.as_ref().and_then(|(_, _, url, _)| url.as_ref()).map_or(session_url, Url::as_str);
+                app_state
+                    .active_users
+                    .update_session_provider_response_headers_from(
+                        &ctx.user.username,
+                        &user_session.token,
+                        &selected_provider_headers,
+                        cookie_origin,
+                    )
+                    .await;
+            }
+        }
 
         let (status_code, header_map) = get_stream_response_with_headers(provider_response.map(|(h, s, _, _)| (h, s)));
         let mut response = axum::response::Response::builder().status(status_code);
@@ -2395,9 +2766,49 @@ pub async fn force_provider_stream_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_response(
+    fingerprint: &Fingerprint,
+    app_state: &Arc<AppState>,
+    session_token: &str,
+    request_class: Option<PlaybackRequestClass>,
+    stream_channel: StreamChannel,
+    stream_url: &str,
+    pinned_provider: Option<&Arc<str>>,
+    req_headers: &HeaderMap,
+    input: &Arc<ConfigInput>,
+    target: &Arc<ConfigTarget>,
+    user: &ProxyUserCredentials,
+    connection_permission: UserConnectionPermission,
+    connection_kind: crate::api::model::ConnectionKind,
+    allow_exhausted_shared_reconnect: bool,
+    grace_mode: Option<crate::api::model::GraceMode>,
+) -> axum::response::Response {
+    stream_response_with_provider_handle(
+        fingerprint,
+        app_state,
+        session_token,
+        request_class,
+        stream_channel,
+        stream_url,
+        pinned_provider,
+        req_headers,
+        input,
+        target,
+        user,
+        connection_permission,
+        connection_kind,
+        allow_exhausted_shared_reconnect,
+        grace_mode,
+        None,
+    )
+    .await
+    .into_response()
+}
+
 /// # Panics
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) async fn stream_response(
+pub(crate) async fn stream_response_with_provider_handle(
     fingerprint: &Fingerprint,
     app_state: &Arc<AppState>,
     session_token: &str,
@@ -2413,6 +2824,7 @@ pub(crate) async fn stream_response(
     connection_kind: crate::api::model::ConnectionKind,
     allow_exhausted_shared_reconnect: bool,
     grace_mode: Option<crate::api::model::GraceMode>,
+    preacquired_provider_handle: Option<tuliprox_session::ManagedProviderHandle>,
 ) -> impl IntoResponse + Send {
     let _transition_guard = app_state.active_users.acquire_playback_transition(&user.username, session_token).await;
     let request_log_stream_url = resolve_request_url_for_logging(input, stream_url);
@@ -2530,7 +2942,7 @@ pub(crate) async fn stream_response(
         .into_response();
     }
 
-    let stream_options = get_stream_options(&app_state.app_config);
+    let stream_options = get_stream_options(&app_state.app_config, StreamResponseMode::Stream);
     let session_state = app_state.active_users.get_and_update_user_session(&user.username, session_token).await;
     let pinned_provider = pinned_provider.filter(|provider| {
         item_type.is_live()
@@ -2539,6 +2951,8 @@ pub(crate) async fn stream_response(
                 .is_some_and(|session| session.media_started.load(std::sync::atomic::Ordering::Acquire))
             || app_state.active_provider.should_reuse_playback_provider(session_token, provider)
     });
+    let provider_session_headers =
+        session_state.as_ref().and_then(|session| session.provider_session_headers_for(stream_url));
     let mut stream_details = match create_stream_response_details(
         app_state,
         &stream_options,
@@ -2557,17 +2971,19 @@ pub(crate) async fn stream_response(
         share_stream,
         connection_permission,
         pinned_provider,
-        pinned_provider.is_none(),
+        pinned_provider.is_none() || allows_provider_pool_failover(item_type),
         true,
         VirtualId::new(stream_channel.virtual_id),
         connection_priority_for_kind(user, connection_kind),
         connection_kind,
         false,
         Some(session_token),
-        session_state.as_ref().map(|session| &session.provider_session_headers),
+        provider_session_headers.as_deref(),
         pinned_provider.is_some(),
         grace_mode.map(|m| matches!(m, crate::api::model::GraceMode::Hold)),
         activation.grace_context.clone(),
+        None,
+        preacquired_provider_handle,
     )
     .await
     {
@@ -2589,7 +3005,7 @@ pub(crate) async fn stream_response(
 
     if item_type == PlaylistItemType::Catchup {
         if let Some(provider_stream) = stream_details.stream.take() {
-            let probe_deadline = Duration::from_millis(app_state.hls_proxy.origin_manifest_timeout_ms().max(1));
+            let probe_deadline = Duration::from_millis(app_state.hls.proxy.origin_manifest_timeout_ms().max(1));
             match probe_catchup_payload(provider_stream, probe_deadline).await {
                 Ok(CatchupPayload::Direct(provider_stream)) => stream_details.stream = Some(provider_stream),
                 Ok(CatchupPayload::HlsManifest(manifest)) => {
@@ -2995,6 +3411,7 @@ struct DetectedCatchupHlsResponseParams<'a> {
     fallback_stream_url: &'a str,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn detected_catchup_hls_response(params: DetectedCatchupHlsResponseParams<'_>) -> axum::response::Response {
     let DetectedCatchupHlsResponseParams {
         app_state,
@@ -3023,6 +3440,11 @@ async fn detected_catchup_hls_response(params: DetectedCatchupHlsResponseParams<
         cleanup_failed_detected_catchup_hls(app_state, &mut stream_details, &user.username, session_token).await;
         return StatusCode::BAD_GATEWAY.into_response();
     };
+    let playlist_kind = classify_hls_playlist(content);
+    if playlist_kind == HlsPlaylistKind::Invalid {
+        cleanup_failed_detected_catchup_hls(app_state, &mut stream_details, &user.username, session_token).await;
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
 
     let response_url = stream_details
         .stream_info
@@ -3042,6 +3464,8 @@ async fn detected_catchup_hls_response(params: DetectedCatchupHlsResponseParams<
             virtual_id: virtual_id.get(),
             input_id: input.id,
             user_token: Some(session_token),
+            origin_provider: Some(&provider),
+            playlist_kind: Some(playlist_kind),
         },
     );
 
@@ -3069,10 +3493,15 @@ async fn detected_catchup_hls_response(params: DetectedCatchupHlsResponseParams<
     if !stream_details.provider_session_headers.is_empty() {
         app_state
             .active_users
-            .update_session_provider_headers(
+            .update_session_provider_response_headers_from(
                 &user.username,
                 &created_session_token,
                 &stream_details.provider_session_headers,
+                stream_details
+                    .stream_info
+                    .as_ref()
+                    .and_then(|(_, _, url, _)| url.as_ref())
+                    .map_or(request_url, Url::as_str),
             )
             .await;
     }
@@ -3082,6 +3511,7 @@ async fn detected_catchup_hls_response(params: DetectedCatchupHlsResponseParams<
         PlaybackKind::Catchup,
         get_catchup_session_ttl_secs(app_state),
     );
+    let binding_tag = stream_details.provider_handle.as_ref().and_then(|handle| handle.handle()?.binding_tag);
     app_state.connection_manager.release_managed_provider_handle(stream_details.provider_handle.take());
     app_state
         .active_users
@@ -3089,6 +3519,29 @@ async fn detected_catchup_hls_response(params: DetectedCatchupHlsResponseParams<
         .await;
     app_state.active_users.clear_unbound_session_addr(&user.username, &created_session_token, &fingerprint.addr).await;
 
+    if playlist_kind == HlsPlaylistKind::Media && hls_media_playlist_wrap_enabled(app_state, target) {
+        let master = wrap_media_playlist(
+            HlsMediaPlaylistWrap {
+                app_state,
+                user,
+                base_url: &base_url,
+                target_id: target.id,
+                input,
+                virtual_id: virtual_id.get(),
+                session_token: &created_session_token,
+                // The canonical catch-up URL, not the provider-resolved one, so a refresh can
+                // resolve it to whichever account is selected then.
+                sealed_url: fallback_stream_url,
+                provider: &provider,
+                binding_tag,
+                known_bitrate_bps: None,
+                stream_ref: None,
+            },
+            rewritten,
+        )
+        .await;
+        return catchup_hls_manifest_response(master);
+    }
     catchup_hls_manifest_response(rewritten)
 }
 
@@ -3227,6 +3680,15 @@ async fn cleanup_forced_reopen_addrs(app_state: &Arc<AppState>, session_owner: &
 
 pub(crate) fn get_catchup_session_ttl_secs(app_state: &Arc<AppState>) -> u64 {
     get_stream_config_u64(app_state, |stream| stream.catchup_session_ttl_secs, default_catchup_session_ttl_secs())
+}
+
+/// Reconnect window of an HLS playback lease: archive playback keeps the catchup window.
+pub(crate) fn get_hls_playback_ttl_secs(app_state: &Arc<AppState>, kind: PlaybackKind) -> u64 {
+    if kind == PlaybackKind::Catchup {
+        get_catchup_session_ttl_secs(app_state)
+    } else {
+        get_hls_session_ttl_secs(app_state)
+    }
 }
 
 pub(crate) fn get_session_reservation_ttl_secs(app_state: &Arc<AppState>, item_type: PlaylistItemType) -> u64 {
@@ -3889,9 +4351,9 @@ async fn fetch_resource_with_retry(
             true,
             |resolved_url| {
                 let http_client = if use_proxy_aware_client {
-                    app_state.resource_public_http_client_no_redirect.load()
+                    app_state.http_clients.resource_public_no_redirect.load()
                 } else {
-                    app_state.resource_http_client_no_redirect.load()
+                    app_state.http_clients.resource_no_redirect.load()
                 };
                 request::get_client_request(
                     &http_client,
@@ -4156,7 +4618,7 @@ async fn open_media_server_image_resource(
             .provider("media-server")
             .detail("media-server image input was not found")
     })?;
-    let http_client = MediaServerHttpClient::new(app_state.http_client.load().as_ref().clone());
+    let http_client = MediaServerHttpClient::new(app_state.http_clients.default.load().as_ref().clone());
 
     let response = match input.input_type {
         InputType::Plex => {

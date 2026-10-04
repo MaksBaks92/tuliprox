@@ -4,6 +4,40 @@
 
 ## ⚠️ Breaking Changes
 
+- **`video.download` is now `video.recording`, and VOD/series downloads are recordings.** Live
+  captures and VOD/series transfers share one queue and one configuration block. A configuration
+  that still contains `video.download` is rejected while loading. To migrate:
+  - rename `video.download` to `video.recording`;
+  - move the keys of the former nested `video.download.recording` block (`enabled`,
+    `container_format`, `timezone`, `filename_template`, padding, `retention`, `disk`, `quota`,
+    `notifications`, `fallback_bytes_per_minute`) up into `video.recording`;
+  - replace `download_priority` and `recording_priority` with the single `priority`;
+  - keep one `directory`; the former download directory and recording directory are no longer
+    separate.
+
+  The `/api/v1/file/download*` and `/api/v1/file/record` routes are removed; recordings are created
+  and controlled through `/api/v1/recording/*`. The permissions `download.read` and
+  `download.write` are removed and decode to nothing, so a groups file that still lists them loses
+  them; grant `recording.read` / `recording.create` / `recording.manage` / `recording.delete`
+  instead.
+
+- **The DVR recording queue is now a recoverable B+Tree, and does not migrate.** The queue moved
+  from `storage_dir/recordings_state.json` to `storage_dir/recordings.db`, with a
+  schema-versioned recovery history under `backup_dir/recordings_recovery/`. An existing
+  `recordings_state.json` is ignored: the queue starts empty on upgrade. The queue also fails
+  closed now — a database that is ahead of every surviving recovery generation refuses to start
+  rather than silently adopting a queue it cannot account for.
+
+- **`recording.write` is split into `recording.create`, `recording.manage` and
+  `recording.delete`.** The removed name decodes to nothing, so a groups file that still lists
+  it loses the permission rather than gaining one of the replacements. The permission schema
+  version is bumped, so tokens issued before the split fail closed and clients must
+  re-authenticate.
+
+- **Recording files are stored owner-independently.** The layout is `<recording-root>/<rel>`
+  with no `users/<owner-id>/` or `shared/` component. Recordings written by an earlier build are
+  not found at the new location and must be moved, or re-recorded.
+
 - **The per-input resource policy is gone again.** `resource_policy` (with `allowed_hosts` / `allowed_networks`) is no
   longer a valid input field, so configurations written for that feature are rejected while loading, and resource links
   minted by it are no longer accepted. Resource destinations are classified instead of configured: a destination on a
@@ -1025,6 +1059,40 @@
 
 ## 🐛 Fixes
 
+- **Proxied live HLS keeps its provider account when the client IP changes.** A player that refreshes its playlist
+  from alternating client IPs (dual-stack IPv4/IPv6, WLAN/mobile switching behind a reverse proxy) created a new
+  playback owner on every IP change. The new owner had no lease or provider affinity, went through normal lineup
+  selection and could land on another provider account, so the provider saw one playback on two accounts. With the
+  shared HLS cache off, an entry request whose provider returns a media playlist is now answered with a single-variant
+  master playlist. Its variant URI is a sealed token that carries the session token, so every refresh keeps the original
+  owner, lease and affinity. The playlist downloaded on the entry request is handed to the immediate variant request,
+  so channel start does not fetch the same playlist twice. A refresh after the session has expired recreates the
+  session from the token and runs the same access checks and admission as the entry route; a session that was
+  evicted, kicked or terminated is not recreated.
+- **HLS tokens carry an explicit resource kind.** Manifest and media references are classified from the playlist and
+  the tag that references them instead of the `.m3u8` extension, so catch-up manifests behind `.ts` or extensionless
+  URLs are admitted as playlist requests and rewritten as playlists, also with a `Range` header. Playlists that list
+  other playlists under `#EXTINF` count as master playlists. Child manifests are only fetched from the provider account
+  that resolved them (a stale one answers `404` without ending the playback), and a media URI resolved by another
+  account answers `404` instead of being fetched with that account's credentials; manifest refreshes forward the provider
+  session cookies stored for the playback, only to the host that set them, and catch-up refreshes renew the lease with
+  `catchup_session_ttl_secs`. Provider session cookies now survive URL changes on the same host.
+- **An upstream response that is not an HLS playlist is a failed manifest.** HTML or JSON bodies answered with `200`
+  were rewritten and served as a playlist. On an entry request they now end the session and return the
+  channel-unavailable manifest; on a playlist refresh they answer `502` and keep the session, so the player retries.
+
+- **A continuing playback keeps its provider after its reconnect window ends.** When an HLS player paused requests
+  longer than `hls_session_ttl_secs`, its lease expired and the next request ran priority selection again, so a playback
+  that had fallen back to an alias moved back to the primary account and then back to the alias. A playback now returns
+  to the provider that last delivered its media for `provider_affinity_ttl_secs` after the reconnect window. This
+  preference holds no connection slot and never causes a grace over-allocation while another provider has a free slot:
+  a full provider still falls back to the lineup. Provider errors on the preferred provider, preemption, kicks and
+  timeouts end it immediately; a failure on a fallback provider keeps it. It applies to reconnect-capable playback
+  (HLS, DASH, Catchup, VOD), not to one-shot live MPEG-TS responses. A delayed failure of an older binding cannot end the preference of its
+  successor. Terminating an HLS session or kicking its client now also releases the provider lease and preference of
+  the binding that session acquired, which the per-retry public HLS token previously left in place. Terminating an
+  unknown or outdated session token leaves a newer playback of the same client, user and channel untouched.
+
 - **Banned, disabled or expired provider accounts are excluded from allocation and remembered.** A login or expiry
   response that reports `Banned`, `Disabled` or `Expired` excludes the account immediately and stores the exclusion in
   `source.yml` (`account_disabled: true` for a root account) or the alias CSV (`enabled` = `0`). `Pending` and other
@@ -1243,11 +1311,12 @@
 - **Auth: an access token minted for one purpose was valid everywhere.** Internal access tokens signed only a timestamp
   and a TTL, so any valid token verified at every place a token was accepted. The capability scope is now mixed into the
   keyed hash and is a compile-time constant on both sides, never caller-supplied. The token string format is unchanged.
-- **Auth: renaming a user orphaned their recordings.** The JWT subject was synthesised from the display name
-  (`web:{username}` / `api:{username}`), so a rename reassigned every recording the old subject owned to a principal
-  that does not exist. Subjects now come from the identity registry, which was already built with persistence,
-  bootstrap and a rename that preserves the id, and was simply never wired into the server. A corrupt registry refuses
-  to start rather than inventing replacement ids.
+- **Auth: a user's subject id is derived from the configured username.** The id in tokens, recordings, rules,
+  per-user quotas and token revocations is `web:<username>` for web users and `api:<username>` for proxy API users,
+  taken from the configured name rather than as typed at sign-in. The identity registry
+  (`identity_registry.json`) that mapped usernames to random ids is removed: nothing called its rename, so it only
+  added a file that had to survive every restart. An existing `identity_registry.json` is ignored and can be deleted.
+  Renaming a user in the configuration starts a new principal.
 - **Auth: passwords typed at the terminal were left in memory.** The interactive password generator left two plaintext
   `String`s sitting after it returned; they are now wiped, the same discipline already applied to a password arriving
   over HTTP. A dead duplicate of the credential type that was never declared in its crate root has been removed.
@@ -1451,6 +1520,15 @@
 
 ## ⚙️ New Settings
 
+- **config.yml (`reverse_proxy.stream`)**:
+  - `hls_wrap_media_playlist` (default `true`): answers a proxied live HLS entry request whose provider returns a media
+    playlist with a single-variant master playlist, so playlist refreshes keep their provider account across client
+    IP changes. Applies only while the shared HLS cache is off for the target. Disable it for players that mishandle a
+    master playlist. Editable in the Web UI under Reverse Proxy → Stream.
+  - `provider_affinity_ttl_secs` (default `120`): seconds a playback keeps preferring its last provider after the
+    reconnect window has ended. It reserves no capacity. `0` ends the preference together with the reconnect window;
+    values above `86400` are rejected. Editable in the Web UI under Reverse Proxy → Stream.
+
 - **Runtime diagnostics (environment variables)**:
   - `TULIPROX_WATCHDOG` (default unset = off) is a mode selector: `1` (`true`/`on`/`yes`/`enabled`) observes and logs
     stalls, `2` (`restart`) additionally exits the process after the stall persists so a supervisor restarts it.
@@ -1598,6 +1676,11 @@
   - The rules use OR semantics: any matching CIDR or country allows the request.
 
 ## 🛠 Maintenance
+
+- **Testkit scenarios can pause and tune reconnect windows.** A step with only `pause_millis` (1 to 300000) idles the
+  scenario, and `policy_contract` accepts `hls_session_ttl_secs` and `provider_affinity_ttl_secs`. The new scenario
+  `m3u-hls-provider-affinity-after-lease-expiry` uses both to prove that a returning HLS playback stays on its
+  fallback account after its reconnect window lapsed and falls back to priority selection once the affinity ended.
 
 - **The testkit can now drive a Stalker/Ministra input.** The fixture origin emulates a portal
   (`handshake`, `get_profile`, `get_genres`, `get_ordered_list`, `create_link`), a scenario selects it with

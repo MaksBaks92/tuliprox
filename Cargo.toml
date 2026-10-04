@@ -3,7 +3,7 @@ members = ["backend/*", "frontend", "shared", "tools/tuliprox-testkit"]
 resolver = "2"
 
 [workspace.package]
-version = "3.3.132"
+version = "3.3.136"
 edition = "2021"
 rust-version = "1.95.0"
 
@@ -23,6 +23,14 @@ must_use_candidate      = "allow"
 return_self_not_must_use = "allow"
 missing_errors_doc      = "allow"
 large_futures           = "allow"
+
+# Its suggested rewrite of `assert!(x.is_empty())` is
+# `assert_eq!(x, [] as [some::crate_root::Path; 0])`, which names a type that
+# is usually not in scope at the assertion — which is why `clippy --fix`
+# declines to apply it. The panic message improves; every one of the 39 call
+# sites gets materially harder to read. Reverse this if the suggestion is
+# ever made to use an in-scope type.
+assert_is_empty         = "allow"
 
 [workspace.dependencies]
 shared = { version = "3", path = "shared" }
@@ -56,12 +64,14 @@ lz4_flex      = "0.14.0"
 brotli        = "8.0.4"
 indexmap      = "2.14.0"
 dashmap       = "6.2.1"
+cookie        = "0.18.2"
 arc-swap      = "1.9.2"
 paste         = "1.0.15"
 pest          = "2.9.0"
 pest_derive   = "2.9.0"
 zeroize       = "1.9.0"
 deunicode     = "1.6.2"
+unicode-normalization = "0.1.25"
 path-clean    = "1.0.1"
 url           = "2.5.8"
 cron          = "0.17.0"

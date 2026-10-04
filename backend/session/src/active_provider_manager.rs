@@ -1,5 +1,5 @@
 use crate::{
-    provider_leases::{ProviderLeaseTable, ProviderLeaseUsage},
+    provider_leases::{ProviderAffinityTtl, ProviderLeaseTable, ProviderLeaseUsage},
     provider_lineup_manager::ProviderLineupManager,
     EventManager, SharedStreamManager,
 };
@@ -92,6 +92,14 @@ fn playback_lease_owner(owner: &str) -> &str {
     } else {
         owner
     }
+}
+
+/// How an acquisition of a playback owner is tied to a provider.
+enum OwnerProviderPin {
+    /// A confirmed or active lease pins the playback to exactly this provider.
+    Reserved(Arc<str>),
+    /// A recently confirmed playback prefers this provider; it holds no capacity.
+    Preferred(Arc<str>),
 }
 
 /// Playback identity of one provider acquisition.
@@ -218,6 +226,110 @@ struct Connections {
     // ProviderName -> BTreeMap<PriorityKey, PriorityOwner>
     priority_index: HashMap<Arc<str>, BTreeMap<PriorityKey, PriorityOwner>>,
     soft_priority_index: HashMap<Arc<str>, BTreeMap<PriorityKey, PriorityOwner>>,
+    // Providers whose allocations were released since the last drain.
+    released_providers: Vec<Arc<str>>,
+}
+
+/// Tables that record which providers' capacity a write freed.
+trait CapacityReleases {
+    fn take_released_providers(&mut self) -> Vec<Arc<str>>;
+}
+
+impl CapacityReleases for Connections {
+    fn take_released_providers(&mut self) -> Vec<Arc<str>> { std::mem::take(&mut self.released_providers) }
+}
+
+impl CapacityReleases for ProviderLeaseTable {
+    fn take_released_providers(&mut self) -> Vec<Arc<str>> { ProviderLeaseTable::take_released_providers(self) }
+}
+
+/// Wakes only the requests waiting for capacity on a provider whose slot or lease was freed.
+#[derive(Default)]
+pub struct ProviderCapacityNotifier {
+    waiters: std::sync::Mutex<HashMap<Arc<str>, Arc<tokio::sync::Notify>>>,
+    staged: std::sync::Mutex<Vec<Arc<str>>>,
+    has_staged: AtomicBool,
+}
+
+impl ProviderCapacityNotifier {
+    fn lock_waiters(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Arc<tokio::sync::Notify>>> {
+        self.waiters.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The notification fired whenever `provider` frees capacity. Provider names are bounded by
+    /// the configuration, so entries are kept.
+    pub fn subscribe(&self, provider: &Arc<str>) -> Arc<tokio::sync::Notify> {
+        Arc::clone(self.lock_waiters().entry(Arc::clone(provider)).or_default())
+    }
+
+    fn notify(&self, provider: &str) {
+        if let Some(notify) = self.lock_waiters().get(provider) {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Called while a table lock is held; [`Self::flush`] delivers after it is released.
+    fn stage(&self, released: Vec<Arc<str>>) {
+        if released.is_empty() {
+            return;
+        }
+        self.staged.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(released);
+        self.has_staged.store(true, Ordering::Release);
+    }
+
+    fn flush(&self) {
+        if !self.has_staged.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut staged = std::mem::take(&mut *self.staged.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        staged.sort_unstable();
+        staged.dedup();
+        let waiters = self.lock_waiters();
+        for provider in &staged {
+            if let Some(notify) = waiters.get(provider) {
+                notify.notify_waiters();
+            }
+        }
+    }
+}
+
+/// Write access to a capacity table that wakes the waiters of freed providers after release.
+///
+/// Fields drop in declaration order: `lock` stages the freed providers while it still holds the
+/// lock and then releases it; only afterwards does `_flush` wake the waiters.
+struct CapacityWriteGuard<'a, T: CapacityReleases> {
+    lock: StagingWriteGuard<'a, T>,
+    _flush: FlushCapacityWaiters<'a>,
+}
+
+struct StagingWriteGuard<'a, T: CapacityReleases> {
+    guard: RwLockWriteGuard<'a, T>,
+    notifier: &'a ProviderCapacityNotifier,
+}
+
+impl<T: CapacityReleases> Drop for StagingWriteGuard<'_, T> {
+    fn drop(&mut self) { self.notifier.stage(self.guard.take_released_providers()); }
+}
+
+struct FlushCapacityWaiters<'a>(&'a ProviderCapacityNotifier);
+
+impl Drop for FlushCapacityWaiters<'_> {
+    fn drop(&mut self) { self.0.flush(); }
+}
+
+impl<'a, T: CapacityReleases> CapacityWriteGuard<'a, T> {
+    fn new(guard: RwLockWriteGuard<'a, T>, notifier: &'a ProviderCapacityNotifier) -> Self {
+        Self { lock: StagingWriteGuard { guard, notifier }, _flush: FlushCapacityWaiters(notifier) }
+    }
+}
+
+impl<T: CapacityReleases> std::ops::Deref for CapacityWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target { &self.lock.guard }
+}
+
+impl<T: CapacityReleases> std::ops::DerefMut for CapacityWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.lock.guard }
 }
 
 pub struct ManagedProviderHandle {
@@ -293,9 +405,16 @@ pub struct ActiveProviderManagerCore {
     connections: std::sync::RwLock<Connections>,
     leases: std::sync::RwLock<ProviderLeaseTable>,
     next_allocation_id: AtomicU64,
+    // Wakes the capacity waiters of a provider when one of its slots or leases is freed.
+    capacity: ProviderCapacityNotifier,
 }
 
 impl ActiveProviderManagerCore {
+    /// Notification fired whenever `provider` frees a slot or ends a lease.
+    pub fn provider_capacity_notify(&self, provider: &Arc<str>) -> Arc<tokio::sync::Notify> {
+        self.capacity.subscribe(provider)
+    }
+
     /// Serialises capacity transitions (acquire/release/reclassify) so a reclassify
     /// cannot race an acquire or release.
     ///
@@ -322,31 +441,35 @@ impl ActiveProviderManagerCore {
         }
     }
 
-    fn write_connections(&self) -> RwLockWriteGuard<'_, Connections> {
-        match self.connections.write() {
+    fn write_connections(&self) -> CapacityWriteGuard<'_, Connections> {
+        let guard = match self.connections.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 error!("Recovering poisoned active-provider connection lock");
                 poisoned.into_inner()
             }
-        }
+        };
+        CapacityWriteGuard::new(guard, &self.capacity)
     }
 
-    fn write_leases(&self) -> RwLockWriteGuard<'_, ProviderLeaseTable> {
-        match self.leases.write() {
+    fn write_leases(&self) -> CapacityWriteGuard<'_, ProviderLeaseTable> {
+        let guard = match self.leases.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 error!("Recovering poisoned provider-lease lock");
                 poisoned.into_inner()
             }
-        }
+        };
+        CapacityWriteGuard::new(guard, &self.capacity)
     }
 
-    #[cfg(test)]
     fn read_leases(&self) -> RwLockReadGuard<'_, ProviderLeaseTable> {
         match self.leases.read() {
             Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => {
+                error!("Recovering poisoned provider-lease lock");
+                poisoned.into_inner()
+            }
         }
     }
 
@@ -394,6 +517,9 @@ impl ActiveProviderManagerCore {
             info.lifecycle = ConnectionLifecycle::Closed;
             info.cancel_token.cancel();
             info.allocation.release();
+            if let Some(name) = info.allocation.get_provider_name() {
+                connections.released_providers.push(name);
+            }
             Some(info.allocation)
         } else {
             None
@@ -632,8 +758,9 @@ impl ActiveProviderManager {
                 shutdown_token: CancellationToken::new(),
                 providers: ProviderLineupManager::new(inputs, grace_period_options, event_manager),
                 connections: std::sync::RwLock::new(Connections::default()),
-                leases: std::sync::RwLock::new(ProviderLeaseTable::default()),
+                leases: std::sync::RwLock::new(ProviderLeaseTable::with_affinity_ttl(Self::get_affinity_ttl(cfg))),
                 next_allocation_id: AtomicU64::new(1),
+                capacity: ProviderCapacityNotifier::default(),
             }),
             shared_stream_manager: OnceLock::new(),
         }
@@ -700,10 +827,15 @@ impl ActiveProviderManager {
 
     fn get_grace_options(cfg: &AppConfig) -> GracePeriodOptions { cfg.config.load().get_grace_options() }
 
+    fn get_affinity_ttl(cfg: &AppConfig) -> ProviderAffinityTtl {
+        ProviderAffinityTtl(cfg.config.load().get_provider_affinity_ttl_secs())
+    }
+
     pub fn update_config(&self, cfg: &AppConfig) {
         let grace_period_options = Self::get_grace_options(cfg);
         let inputs = Self::get_config_inputs(cfg);
         self.providers.update_config(inputs, &grace_period_options);
+        self.write_leases().set_affinity_ttl(Self::get_affinity_ttl(cfg));
         self.reconcile_connections();
     }
 
@@ -742,16 +874,36 @@ impl ActiveProviderManager {
         leases.has_foreign_reserved_lease(provider_name, session_owner)
     }
 
-    fn get_reserved_provider_for_owner(&self, input_name: &Arc<str>, session_owner: &str) -> Option<Arc<str>> {
+    /// Resolves how a playback owner is bound to a provider of `input_name`, with a
+    /// single lease-table lookup per acquisition.
+    fn owner_provider_pin(&self, input_name: &Arc<str>, session_owner: &str) -> Option<OwnerProviderPin> {
+        let (lease_pin, affinity_provider) = {
+            let mut leases = self.write_leases();
+            Self::prune_expired_leases(&mut leases);
+            let lease_pin = leases
+                .lease_of_owner(session_owner)
+                .map(|lease| (Arc::clone(&lease.provider_name), lease.state.is_confirmed()));
+            (lease_pin, leases.affinity_provider_for_owner(session_owner))
+        };
+        // The lease lock is released before the connection lock is taken.
+        if let Some((provider_name, confirmed)) = lease_pin {
+            if self.providers.is_provider_for_input(&provider_name, input_name)
+                && (confirmed || self.has_active_owner_for_provider(&provider_name, session_owner))
+            {
+                return Some(OwnerProviderPin::Reserved(provider_name));
+            }
+        }
+        affinity_provider
+            .filter(|provider_name| self.providers.is_provider_for_input(provider_name, input_name))
+            .map(OwnerProviderPin::Preferred)
+    }
+
+    /// Provider a playback currently prefers on re-entry, for diagnostics and tests.
+    pub fn provider_affinity_for_owner(&self, session_owner: &str) -> Option<Arc<str>> {
+        let session_owner = playback_lease_owner(session_owner);
         let mut leases = self.write_leases();
         Self::prune_expired_leases(&mut leases);
-        let lease = leases.lease_of_owner(session_owner)?;
-        let provider_name = Arc::clone(&lease.provider_name);
-        let confirmed = lease.state.is_confirmed();
-        drop(leases);
-        (self.providers.is_provider_for_input(&provider_name, input_name)
-            && (confirmed || self.has_active_owner_for_provider(&provider_name, session_owner)))
-        .then_some(provider_name)
+        leases.affinity_provider_for_owner(session_owner)
     }
 
     /// A provisional lease only pins its provider while its allocation is active.
@@ -832,6 +984,10 @@ impl ActiveProviderManager {
     ) -> Option<(usize, usize, usize)> {
         let (current_connections, max_connections) = self.providers.provider_capacity(provider_name)?;
         if max_connections == 0 {
+            return Some((current_connections, max_connections, 0));
+        }
+        // Without any foreign reserving lease the owner analysis cannot change the result.
+        if !self.read_leases().has_foreign_reserved_lease(provider_name, session_owner) {
             return Some((current_connections, max_connections, 0));
         }
         let counted_owners = self.active_reservation_owners(provider_name);
@@ -1028,7 +1184,40 @@ impl ActiveProviderManager {
         }
         let _transition = self.lock_capacity_transition();
         let mut leases = self.write_leases();
+        leases.forget_affinity(session_owner);
         leases.release_owner(session_owner);
+    }
+
+    /// Administrative end of the playback behind a session that was actually terminated
+    /// (terminate endpoint, kick).
+    ///
+    /// A public HLS token shares its stable owner with the retries of the same
+    /// client/user/channel, so it only ends the binding it acquired itself. A stale
+    /// token therefore never removes the lease or provider preference of a newer
+    /// binding. A bare owner keeps the owner-wide release semantics.
+    pub fn terminate_identified_playback_owner(&self, session_token: &str) -> bool {
+        let owner = playback_lease_owner(session_token);
+        let _transition = self.lock_capacity_transition();
+        let mut leases = self.write_leases();
+        if owner == session_token {
+            leases.forget_affinity(owner);
+            return leases.release_owner(owner).is_some();
+        }
+        leases.terminate_identified_token(owner, session_token)
+    }
+
+    /// Ends the provider preference of a failed playback, but only while it still
+    /// belongs to the exact binding that failed. A delayed failure of an older binding
+    /// leaves the successor's preference intact.
+    pub fn forget_identified_provider_affinity(
+        &self,
+        session_owner: &str,
+        provider_name: &Arc<str>,
+        binding_tag: ProviderBindingTag,
+    ) -> bool {
+        let session_owner = playback_lease_owner(session_owner);
+        let _transition = self.lock_capacity_transition();
+        self.write_leases().forget_identified_affinity(session_owner, provider_name, binding_tag)
     }
 
     pub fn clear_identified_provider_reservation(
@@ -1365,8 +1554,33 @@ impl ActiveProviderManager {
         params: &AcquireProviderParams<'_>,
     ) -> Option<ProviderHandle> {
         if let Some(owner) = params.session_owner() {
-            if let Some(reserved_provider) = self.get_reserved_provider_for_owner(provider_or_input_name, owner) {
-                return self.acquire_exact_connection_inner_no_preempt(&reserved_provider, allow_grace, params);
+            match self.owner_provider_pin(provider_or_input_name, owner) {
+                Some(OwnerProviderPin::Reserved(reserved_provider)) => {
+                    return self.acquire_exact_connection_inner_no_preempt(&reserved_provider, allow_grace, params);
+                }
+                // A continuing playback whose reconnect lease lapsed during a request gap
+                // returns to its provider before priority selection, but only into free
+                // capacity: the lineup prefers any free slot over a grace over-allocation,
+                // so the preference must not force one either.
+                Some(OwnerProviderPin::Preferred(affinity_provider)) => {
+                    if let Some(handle) =
+                        self.acquire_exact_connection_inner_no_preempt(&affinity_provider, false, params)
+                    {
+                        debug_if_enabled!(
+                            "Provider affinity kept: provider={} owner={} playback_kind={}",
+                            sanitize_sensitive_info(&affinity_provider),
+                            sanitize_sensitive_info(owner),
+                            params.lease.map_or_else(|| "-".to_string(), |lease| lease.kind.to_string())
+                        );
+                        return Some(handle);
+                    }
+                    debug_if_enabled!(
+                        "Provider affinity unavailable, using lineup: provider={} owner={}",
+                        sanitize_sensitive_info(&affinity_provider),
+                        sanitize_sensitive_info(owner)
+                    );
+                }
+                None => {}
             }
         }
 
@@ -1452,6 +1666,9 @@ impl ActiveProviderManager {
             let mut leases = self.write_leases();
             Self::prune_expired_leases(&mut leases);
             let id = leases.begin_owner(lease.provider_owner(), &provider_name, lease.kind, lease.request_id);
+            if lease.owner != lease.provider_owner() {
+                leases.attach_request_token(id, lease.request_id, lease.owner);
+            }
             let generation = leases.lease(id).map_or(1, |lease| lease.binding_generation);
             debug_if_enabled!(
                 "Playback lease began: provider={} owner={} kind={} request_id={} lease_id={} generation={} state=starting",
@@ -1800,17 +2017,7 @@ impl ActiveProviderManager {
 
                 match action {
                     ReleaseAction::Wait(victim_id, gen, comp_token) => {
-                        let shutdown_token = self.shutdown_token.clone();
-                        let core = Arc::clone(&self.core);
-                        let reaper_token = comp_token.clone();
-                        tokio::spawn(async move {
-                            tokio::select! {
-                                () = shutdown_token.cancelled() => {},
-                                () = reaper_token.cancelled() => {
-                                    core.complete_release_with_generation(victim_id, Some(gen));
-                                }
-                            }
-                        });
+                        self.spawn_preemption_reaper(victim_id, gen, comp_token.clone());
                         PreemptionOutcome::PendingCompletion(Some((victim_id, gen)), comp_token)
                     }
                     ReleaseAction::None => {
@@ -1823,6 +2030,9 @@ impl ActiveProviderManager {
                                     .get(&victim_alloc_id)
                                     .map(|info| (victim_alloc_id, info.open_generation))
                             };
+                            if let Some((victim_id, gen)) = victim_identity {
+                                self.spawn_preemption_reaper(victim_id, gen, token.clone());
+                            }
                             PreemptionOutcome::PendingCompletion(victim_identity, token)
                         } else {
                             PreemptionOutcome::Exhausted
@@ -2047,6 +2257,59 @@ impl ActiveProviderManager {
         kind: ConnectionKind,
         lease: Option<PlaybackLeaseRef<'_>>,
     ) -> Option<ProviderHandle> {
+        self.acquire_exact_connection_with_lease_for_session_until(
+            provider_name,
+            addr,
+            allow_grace,
+            priority,
+            kind,
+            lease,
+            None,
+        )
+        .await
+    }
+
+    /// Frees a preempted victim's slot once its body completes, or after
+    /// `PREEMPTION_COMPLETION_TIMEOUT` at the latest. It runs independently of the preempting
+    /// request, so a request dropped while waiting (client disconnect, deadline, cancelled
+    /// future) cannot leave the victim's slot occupied.
+    fn spawn_preemption_reaper(&self, victim_id: AllocationId, generation: u64, completion_token: CancellationToken) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let shutdown_token = self.shutdown_token.clone();
+        let core = Arc::clone(&self.core);
+        runtime.spawn(async move {
+            tokio::select! {
+                () = shutdown_token.cancelled() => {}
+                _ = tokio::time::timeout(PREEMPTION_COMPLETION_TIMEOUT, completion_token.cancelled()) => {
+                    core.complete_release_with_generation(victim_id, Some(generation));
+                }
+            }
+        });
+    }
+
+    /// Earliest instant at which a playback lease may expire and free reserved capacity, after
+    /// pruning the ones already expired. Lease expiry is time based and sends no notification.
+    pub fn next_lease_expiry(&self) -> Option<TokioInstant> {
+        let mut leases = self.write_leases();
+        Self::prune_expired_leases(&mut leases);
+        leases.next_expiry()
+    }
+
+    /// Like [`Self::acquire_exact_connection_with_lease_for_session_await`], but never waits past
+    /// `deadline`. A preemption that outlives the deadline is finished by its reaper.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_exact_connection_with_lease_for_session_until(
+        &self,
+        provider_name: &Arc<str>,
+        addr: &SocketAddr,
+        allow_grace: bool,
+        priority: i8,
+        kind: ConnectionKind,
+        lease: Option<PlaybackLeaseRef<'_>>,
+        deadline: Option<TokioInstant>,
+    ) -> Option<ProviderHandle> {
         let params = AcquireProviderParams { addr, priority, kind, lease };
         let outcome = {
             if self.is_shutting_down.load(Ordering::Acquire) {
@@ -2074,8 +2337,14 @@ impl ActiveProviderManager {
                 Some(self.register_allocation(alloc, &params))
             }
             PreemptionOutcome::PendingCompletion(victim_identity, completion_token) => {
-                let _ = tokio::time::timeout(PREEMPTION_COMPLETION_TIMEOUT, completion_token.cancelled()).await;
+                let completion_deadline = TokioInstant::now() + PREEMPTION_COMPLETION_TIMEOUT;
+                let wait_until = deadline.map_or(completion_deadline, |deadline| deadline.min(completion_deadline));
+                let completed = tokio::time::timeout_at(wait_until, completion_token.cancelled()).await.is_ok();
                 if self.is_shutting_down.load(Ordering::Acquire) {
+                    return None;
+                }
+                if !completed && wait_until < completion_deadline {
+                    // The preemption reaper forces the victim release on time without this caller.
                     return None;
                 }
                 let _transition = self.lock_capacity_transition();
@@ -2112,6 +2381,43 @@ impl ActiveProviderManager {
             false,
             &AcquireProviderParams { addr: &DUMMY_ADDR, priority, kind: ConnectionKind::Normal, lease: None },
         )
+    }
+
+    /// Transfers an already reserved recording allocation into the internal
+    /// playback request that opens the provider body. The worker keeps its
+    /// original handle so preemption can still stop the recording; releases
+    /// are allocation-id based and therefore remain idempotent.
+    pub fn claim_download_connection(
+        &self,
+        allocation_id: AllocationId,
+        input_name: &Arc<str>,
+    ) -> Option<ProviderHandle> {
+        let _transition = self.lock_capacity_transition();
+        let mut connections = self.write_connections();
+        let info = connections.single.get_mut(&allocation_id)?;
+        if info.lifecycle != ConnectionLifecycle::Active || info.has_body_owner {
+            return None;
+        }
+        let provider_name = info.allocation.get_provider_name()?;
+        if !self.providers.is_provider_for_input(provider_name.as_ref(), input_name.as_ref()) {
+            return None;
+        }
+
+        // Claim under the capacity-transition lock so a duplicated internal
+        // request cannot attach a second provider body to this reservation.
+        info.lifecycle = ConnectionLifecycle::Opening;
+        let handle = ProviderHandle {
+            playback_request_id: info.playback_request_id,
+            binding_tag: None,
+            client_id: info.client_addr,
+            allocation_id: info.allocation_id,
+            allocation: info.allocation.clone(),
+            cancel_token: Some(info.cancel_token.clone()),
+            completion_token: Some(info.completion_token.clone()),
+            close_reason: Arc::clone(&info.close_reason),
+            open_generation: info.open_generation,
+        };
+        Some(handle)
     }
 
     // This method is used for redirects to cycle through the provider
@@ -2235,6 +2541,9 @@ impl ActiveProviderManager {
                 allocation.get_provider_name().unwrap_or_default()
             );
             allocation.release();
+            if let Some(name) = allocation.get_provider_name() {
+                self.capacity.notify(&name);
+            }
         }
     }
 
@@ -2374,6 +2683,9 @@ impl ActiveProviderManager {
         }
         if let Some(allocation) = released.as_ref() {
             allocation.release();
+            if let Some(name) = allocation.get_provider_name() {
+                connections.released_providers.push(name);
+            }
         }
         released
     }
@@ -4710,6 +5022,31 @@ mod tests {
         manager.release_handle(&alloc_2);
     }
 
+    #[test]
+    fn recording_allocation_is_claimed_without_consuming_a_second_slot() {
+        let app_cfg = build_test_app_config(None, 1);
+        let event_manager = Arc::new(EventManager::new());
+        let manager = ActiveProviderManager::new(&app_cfg, &event_manager);
+        let input_name = "provider_1".intern();
+
+        let reserved =
+            manager.acquire_connection_for_download(&input_name, 0).expect("recording reserves the only provider slot");
+        assert_eq!(manager.get_provider_connections_count(), 1);
+
+        let claimed = manager
+            .claim_download_connection(reserved.allocation_id, &input_name)
+            .expect("internal recording request claims the existing reservation");
+        assert_eq!(claimed.allocation_id, reserved.allocation_id);
+        assert_eq!(manager.get_provider_connections_count(), 1, "claim must not allocate a second slot");
+        assert!(
+            manager.claim_download_connection(reserved.allocation_id, &input_name).is_none(),
+            "one reservation can only own one provider body"
+        );
+
+        manager.complete_release(reserved.allocation_id);
+        assert_eq!(manager.get_provider_connections_count(), 0);
+    }
+
     /// A=2 / B=3 pool: five confirmed playbacks exhaust the pool and a sixth start is
     /// rejected; releasing one confirmed playback frees exactly one slot again.
     #[tokio::test]
@@ -4850,6 +5187,482 @@ mod tests {
         Ok(())
     }
 
+    /// Primary `provider_1` with an alias `provider_2` behind it.
+    fn alias_pool(primary_max: u16, alias_max: u16) -> (ActiveProviderManager, Arc<str>, Arc<str>) {
+        let app_cfg = create_test_app_config_with_pool(primary_max, alias_max);
+        let manager = ActiveProviderManager::new(&app_cfg, &Arc::new(EventManager::new()));
+        (manager, "provider_1".intern(), "provider_2".intern())
+    }
+
+    fn acquire_live_hls_from_lineup(
+        manager: &ActiveProviderManager,
+        input: &Arc<str>,
+        token: &str,
+        port: u16,
+    ) -> Result<tuliprox_core::model::ProviderHandle, String> {
+        manager
+            .acquire_connection_with_lease_for_session(
+                input,
+                &SocketAddr::from(([172, 18, 0, 9], port)),
+                false,
+                default_user_priority(),
+                ConnectionKind::Normal,
+                Some(PlaybackLeaseRef::new(token, PlaybackKind::LiveHls)),
+            )
+            .ok_or_else(|| format!("no provider for {token}"))
+    }
+
+    /// Starts `token` on the alias while the primary is full, confirms media, ends the
+    /// request cleanly, frees the primary and lets the reconnect lease lapse.
+    async fn live_hls_playback_on_alias_with_lapsed_lease(
+        manager: &ActiveProviderManager,
+        input: &Arc<str>,
+        alias: &Arc<str>,
+        token: &str,
+        outcome: PlaybackRequestOutcome,
+    ) -> Result<(), String> {
+        let busy_1 = acquire_live_hls_from_lineup(manager, input, "busy-1|bob|7|hls|0123456789abcdef", 50_001)?;
+        let busy_2 = acquire_live_hls_from_lineup(manager, input, "busy-2|carol|8|hls|0123456789abcdef", 50_002)?;
+        assert_eq!(busy_1.allocation.get_provider_name().as_ref(), Some(input));
+        assert_eq!(busy_2.allocation.get_provider_name().as_ref(), Some(input));
+
+        let handle = acquire_live_hls_from_lineup(manager, input, token, 50_010)?;
+        let provider = handle.allocation.get_provider_name().ok_or("provider")?;
+        assert_eq!(&provider, alias, "full primary must fall back to the alias");
+        let request_id = handle.playback_request_id.ok_or("identified request")?;
+        manager.refresh_adaptive_playback_lease(&provider, token, PlaybackKind::LiveHls, 15);
+        manager.confirm_identified_playback_activity(token, request_id).ok_or("confirmation")?;
+        manager.release_handle(&handle);
+        manager.finish_identified_playback_request(token, request_id, outcome);
+
+        manager.release_handle(&busy_1);
+        manager.release_handle(&busy_2);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(manager.provider_lease_usage(alias).total(), 0, "reconnect lease must have lapsed");
+        assert_eq!(manager.provider_lease_usage(input).total(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_hls_reentry_keeps_alias_affinity_after_lease_expiry() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        live_hls_playback_on_alias_with_lapsed_lease(
+            &manager,
+            &input,
+            &alias,
+            "client|alice|42|hls|0123456789abcdef",
+            PlaybackRequestOutcome::Completed,
+        )
+        .await?;
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&alias)));
+        // Affinity reserves nothing: another playback still gets the free primary slot.
+        let other = acquire_live_hls_from_lineup(&manager, &input, "client|dave|42|hls|0123456789abcdef", 50_012)?;
+        assert_eq!(other.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        manager.release_handle(&reentry);
+        manager.release_handle(&other);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_hls_alias_affinity_ends_after_its_window() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        live_hls_playback_on_alias_with_lapsed_lease(
+            &manager,
+            &input,
+            &alias,
+            "client|alice|42|hls|0123456789abcdef",
+            PlaybackRequestOutcome::Completed,
+        )
+        .await?;
+        tokio::time::advance(Duration::from_secs(shared::defaults::default_provider_affinity_ttl_secs())).await;
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        manager.release_handle(&reentry);
+        Ok(())
+    }
+
+    /// Starts `token` on the alias while the primary is full and confirms media. The
+    /// request stays attached; the primary is freed again before returning.
+    fn confirmed_alias_request(
+        manager: &ActiveProviderManager,
+        input: &Arc<str>,
+        alias: &Arc<str>,
+        token: &str,
+    ) -> Result<tuliprox_core::model::ProviderHandle, String> {
+        let busy_1 = acquire_live_hls_from_lineup(manager, input, "busy-1|bob|7|hls|0123456789abcdef", 50_001)?;
+        let busy_2 = acquire_live_hls_from_lineup(manager, input, "busy-2|carol|8|hls|0123456789abcdef", 50_002)?;
+        let handle = acquire_live_hls_from_lineup(manager, input, token, 50_010)?;
+        assert_eq!(handle.allocation.get_provider_name().as_ref(), Some(alias));
+        let request_id = handle.playback_request_id.ok_or("identified request")?;
+        manager.refresh_adaptive_playback_lease(alias, token, PlaybackKind::LiveHls, 15);
+        manager.confirm_identified_playback_activity(token, request_id).ok_or("confirmation")?;
+        manager.release_handle(&busy_1);
+        manager.release_handle(&busy_2);
+        Ok(handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_failure_after_lease_expiry_ends_alias_affinity() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        let token = "client|alice|42|hls|0123456789abcdef";
+        let handle = confirmed_alias_request(&manager, &input, &alias, token)?;
+        let request_id = handle.playback_request_id.ok_or("identified request")?;
+        manager.release_handle(&handle);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        manager.prune_expired_leases_now();
+        assert_eq!(manager.provider_lease_usage(&alias).total(), 0, "lease must have expired");
+
+        manager.finish_identified_playback_request(token, request_id, PlaybackRequestOutcome::ProviderFailed);
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        manager.release_handle(&reentry);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_failure_of_older_binding_keeps_successor_affinity() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        let old_token = "client|alice|42|hls|0123456789abcdef";
+        let new_token = "client|alice|42|hls|fedcba9876543210";
+
+        // An older binding on the primary that never confirmed media.
+        let old = manager
+            .acquire_exact_connection_with_lease_for_session(
+                &input,
+                &SocketAddr::from(([172, 18, 0, 9], 50_000)),
+                false,
+                default_user_priority(),
+                ConnectionKind::Normal,
+                Some(PlaybackLeaseRef::new(old_token, PlaybackKind::LiveHls)),
+            )
+            .ok_or("old binding")?;
+        let old_request = old.playback_request_id.ok_or("old request")?;
+        let old_tag = old.binding_tag.ok_or("old tag")?;
+        manager.release_handle(&old);
+
+        let current = confirmed_alias_request(&manager, &input, &alias, new_token)?;
+        let current_request = current.playback_request_id.ok_or("current request")?;
+        manager.release_handle(&current);
+        manager.finish_identified_playback_request(new_token, current_request, PlaybackRequestOutcome::Completed);
+
+        // Delayed manifest failures of the older binding arrive after the rebind.
+        assert!(!manager.forget_identified_provider_affinity(old_token, &input, old_tag));
+        manager.finish_identified_playback_request(old_token, old_request, PlaybackRequestOutcome::ProviderFailed);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(manager.provider_lease_usage(&alias).total(), 0, "lease must have expired");
+        manager.finish_identified_playback_request(old_token, old_request, PlaybackRequestOutcome::ProviderFailed);
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|00000000000000aa", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&alias)));
+        manager.release_handle(&reentry);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn administrative_termination_of_hls_token_ends_affinity_and_lease() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        let token = "client|alice|42|hls|0123456789abcdef";
+        let handle = confirmed_alias_request(&manager, &input, &alias, token)?;
+        let request_id = handle.playback_request_id.ok_or("identified request")?;
+        manager.release_handle(&handle);
+        manager.finish_identified_playback_request(token, request_id, PlaybackRequestOutcome::Completed);
+        assert_eq!(manager.provider_lease_usage(&alias).idle, 1);
+
+        // The bare-owner clear has no delete right for public HLS tokens.
+        manager.clear_provider_reservation(token);
+        assert_eq!(manager.provider_lease_usage(&alias).idle, 1);
+        manager.terminate_identified_playback_owner(token);
+        assert_eq!(manager.provider_lease_usage(&alias).total(), 0);
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        manager.release_handle(&reentry);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_hls_token_termination_keeps_newer_binding() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        let old_token = "client|alice|42|hls|0123456789abcdef";
+        let new_token = "client|alice|42|hls|fedcba9876543210";
+
+        let old = confirmed_alias_request(&manager, &input, &alias, old_token)?;
+        let old_request = old.playback_request_id.ok_or("old request")?;
+        manager.release_handle(&old);
+        manager.finish_identified_playback_request(old_token, old_request, PlaybackRequestOutcome::Completed);
+
+        // The retry re-enters the idle lease and starts a new binding incarnation.
+        let new = acquire_live_hls_from_lineup(&manager, &input, new_token, 50_011)?;
+        assert_eq!(new.allocation.get_provider_name(), Some(Arc::clone(&alias)));
+        assert_ne!(new.binding_tag, old.binding_tag);
+        let new_request = new.playback_request_id.ok_or("new request")?;
+        manager.refresh_adaptive_playback_lease(&alias, new_token, PlaybackKind::LiveHls, 15);
+        manager.confirm_identified_playback_activity(new_token, new_request).ok_or("confirmation")?;
+        manager.release_handle(&new);
+        manager.finish_identified_playback_request(new_token, new_request, PlaybackRequestOutcome::Completed);
+        assert_eq!(manager.provider_lease_usage(&alias).idle, 1);
+
+        assert!(!manager.terminate_identified_playback_owner(old_token));
+        assert_eq!(manager.provider_lease_usage(&alias).idle, 1, "stale token must keep the newer lease");
+        assert_eq!(manager.provider_affinity_for_owner(new_token), Some(Arc::clone(&alias)));
+
+        assert!(manager.terminate_identified_playback_owner(new_token));
+        assert_eq!(manager.provider_lease_usage(&alias).total(), 0);
+        assert_eq!(manager.provider_affinity_for_owner(new_token), None);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminating_token_of_expired_binding_ends_its_affinity_only() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        let token = "client|alice|42|hls|0123456789abcdef";
+        let handle = confirmed_alias_request(&manager, &input, &alias, token)?;
+        manager.release_handle(&handle);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(manager.provider_lease_usage(&alias).total(), 0, "lease must have expired");
+
+        assert!(!manager.terminate_identified_playback_owner("client|alice|42|hls|00000000000000aa"));
+        assert_eq!(manager.provider_affinity_for_owner(token), Some(Arc::clone(&alias)));
+        assert!(manager.terminate_identified_playback_owner(token));
+        assert_eq!(manager.provider_affinity_for_owner(token), None);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finished_retry_tokens_do_not_accumulate_on_an_active_binding() -> Result<(), String> {
+        let app_cfg = create_test_app_config_with_pool(2, 0);
+        let event_manager = Arc::new(EventManager::new());
+        let manager = ActiveProviderManager::new(&app_cfg, &event_manager);
+        let input = "provider_1".intern();
+        let first = "client|alice|42|hls|0000000000000000";
+        // One request stays in flight for the whole run and keeps the binding active.
+        let anchor = acquire_live_hls_from_lineup(&manager, &input, first, 50_000)?;
+        let anchor_request = anchor.playback_request_id.ok_or("anchor request")?;
+        manager.refresh_adaptive_playback_lease(&input, first, PlaybackKind::LiveHls, 15);
+        manager.confirm_identified_playback_activity(first, anchor_request).ok_or("confirmation")?;
+
+        let mut last_token = String::new();
+        for attempt in 1..=1_000_u32 {
+            last_token = format!("client|alice|42|hls|{attempt:016x}");
+            let handle = acquire_live_hls_from_lineup(&manager, &input, &last_token, 50_001)?;
+            assert_eq!(handle.binding_tag, anchor.binding_tag, "retries share the active binding");
+            let request_id = handle.playback_request_id.ok_or("retry request")?;
+            manager.refresh_adaptive_playback_lease(&input, &last_token, PlaybackKind::LiveHls, 15);
+            manager.release_handle(&handle);
+            manager.finish_identified_playback_request(&last_token, request_id, PlaybackRequestOutcome::Completed);
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        let claims = manager.write_leases().request_token_claims(super::playback_lease_owner(first));
+        assert!(claims <= 17, "only the anchor and recently finished retries may hold a claim, got {claims}");
+        // The anchor keeps its claim while its request runs; a recent retry still has its cleanup right.
+        assert!(manager.write_leases().request_token_claims(super::playback_lease_owner(first)) >= 2);
+        assert!(manager.terminate_identified_playback_owner(&last_token));
+        manager.release_handle(&anchor);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn affinity_never_forces_grace_over_allocation_while_primary_is_free() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 1);
+        live_hls_playback_on_alias_with_lapsed_lease(
+            &manager,
+            &input,
+            &alias,
+            "client|alice|42|hls|0123456789abcdef",
+            PlaybackRequestOutcome::Completed,
+        )
+        .await?;
+        let alias_holder = manager
+            .acquire_exact_connection_with_lease_for_session(
+                &alias,
+                &SocketAddr::from(([172, 18, 0, 9], 50_020)),
+                false,
+                default_user_priority(),
+                ConnectionKind::Normal,
+                Some(PlaybackLeaseRef::new("client|erin|9|hls|0123456789abcdef", PlaybackKind::LiveHls)),
+            )
+            .ok_or("alias holder")?;
+
+        // Grace is enabled by default and allowed for this request.
+        let reentry = manager
+            .acquire_connection_with_lease_for_session(
+                &input,
+                &SocketAddr::from(([172, 18, 0, 9], 50_011)),
+                true,
+                default_user_priority(),
+                ConnectionKind::Normal,
+                Some(PlaybackLeaseRef::new("client|alice|42|hls|fedcba9876543210", PlaybackKind::LiveHls)),
+            )
+            .ok_or("re-entry")?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        assert!(
+            matches!(reentry.allocation, ProviderAllocation::Available(_)),
+            "a free primary slot beats a grace allocation"
+        );
+        manager.release_handle(&reentry);
+        manager.release_handle(&alias_holder);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_on_fallback_provider_keeps_preference_for_preferred_provider() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 1);
+        let token = "client|alice|42|hls|0123456789abcdef";
+        live_hls_playback_on_alias_with_lapsed_lease(
+            &manager,
+            &input,
+            &alias,
+            token,
+            PlaybackRequestOutcome::Completed,
+        )
+        .await?;
+        let alias_holder = manager
+            .acquire_exact_connection_with_lease_for_session(
+                &alias,
+                &SocketAddr::from(([172, 18, 0, 9], 50_020)),
+                false,
+                default_user_priority(),
+                ConnectionKind::Normal,
+                Some(PlaybackLeaseRef::new("client|erin|9|hls|0123456789abcdef", PlaybackKind::LiveHls)),
+            )
+            .ok_or("alias holder")?;
+
+        // The full alias sends the re-entry to the primary, which then fails before media.
+        let fallback = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(fallback.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        let fallback_request = fallback.playback_request_id.ok_or("fallback request")?;
+        manager.release_handle(&fallback);
+        manager.finish_identified_playback_request(
+            "client|alice|42|hls|fedcba9876543210",
+            fallback_request,
+            PlaybackRequestOutcome::FailedBeforeMedia,
+        );
+
+        assert_eq!(manager.provider_affinity_for_owner(token), Some(Arc::clone(&alias)));
+        manager.release_handle(&alias_holder);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_ts_playback_records_no_provider_affinity() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        let busy_1 = acquire_live_hls_from_lineup(&manager, &input, "busy-1|bob|7|hls|0123456789abcdef", 50_001)?;
+        let busy_2 = acquire_live_hls_from_lineup(&manager, &input, "busy-2|carol|8|hls|0123456789abcdef", 50_002)?;
+        let owner = "ts-session-token";
+        let handle = manager
+            .acquire_connection_with_lease_for_session(
+                &input,
+                &SocketAddr::from(([172, 18, 0, 9], 50_010)),
+                false,
+                default_user_priority(),
+                ConnectionKind::Normal,
+                Some(PlaybackLeaseRef::new(owner, PlaybackKind::LiveTs)),
+            )
+            .ok_or("ts playback")?;
+        assert_eq!(handle.allocation.get_provider_name(), Some(Arc::clone(&alias)));
+        let request_id = handle.playback_request_id.ok_or("ts request")?;
+        manager.confirm_identified_playback_activity(owner, request_id).ok_or("confirmation")?;
+        manager.release_handle(&handle);
+        manager.finish_identified_playback_request(owner, request_id, PlaybackRequestOutcome::ClientClosed);
+        manager.release_handle(&busy_1);
+        manager.release_handle(&busy_2);
+
+        assert_eq!(manager.provider_affinity_for_owner(owner), None, "live TS has nothing to return to");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn huge_reconnect_and_affinity_windows_never_panic() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        manager.write_leases().set_affinity_ttl(crate::provider_leases::ProviderAffinityTtl(u64::MAX));
+        let token = "client|alice|42|hls|0123456789abcdef";
+        let handle = acquire_live_hls_from_lineup(&manager, &input, token, 50_010)?;
+        let provider = handle.allocation.get_provider_name().ok_or("provider")?;
+        let request_id = handle.playback_request_id.ok_or("request")?;
+        manager.refresh_adaptive_playback_lease(&provider, token, PlaybackKind::LiveHls, u64::MAX);
+        manager.confirm_identified_playback_activity(token, request_id).ok_or("confirmation")?;
+        manager.release_handle(&handle);
+        manager.finish_identified_playback_request(token, request_id, PlaybackRequestOutcome::Completed);
+        assert_eq!(manager.provider_affinity_for_owner(token), Some(provider));
+        assert_eq!(manager.provider_lease_usage(&alias).total(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_provider_affinity_ttl_ends_affinity_with_reconnect_window() -> Result<(), String> {
+        let app_cfg = create_test_app_config_with_pool(2, 0);
+        let event_manager = Arc::new(EventManager::new());
+        let manager = ActiveProviderManager::new(&app_cfg, &event_manager);
+        manager.write_leases().set_affinity_ttl(crate::provider_leases::ProviderAffinityTtl(0));
+        let input = "provider_1".intern();
+        let alias = "provider_2".intern();
+        live_hls_playback_on_alias_with_lapsed_lease(
+            &manager,
+            &input,
+            &alias,
+            "client|alice|42|hls|0123456789abcdef",
+            PlaybackRequestOutcome::Completed,
+        )
+        .await?;
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        manager.release_handle(&reentry);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_hls_provider_failure_ends_alias_affinity() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 0);
+        live_hls_playback_on_alias_with_lapsed_lease(
+            &manager,
+            &input,
+            &alias,
+            "client|alice|42|hls|0123456789abcdef",
+            PlaybackRequestOutcome::ProviderFailed,
+        )
+        .await?;
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        manager.release_handle(&reentry);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_hls_full_affinity_provider_falls_back_to_lineup() -> Result<(), String> {
+        let (manager, input, alias) = alias_pool(2, 1);
+        live_hls_playback_on_alias_with_lapsed_lease(
+            &manager,
+            &input,
+            &alias,
+            "client|alice|42|hls|0123456789abcdef",
+            PlaybackRequestOutcome::Completed,
+        )
+        .await?;
+        let alias_holder = manager
+            .acquire_exact_connection_with_lease_for_session(
+                &alias,
+                &SocketAddr::from(([172, 18, 0, 9], 50_020)),
+                false,
+                default_user_priority(),
+                ConnectionKind::Normal,
+                Some(PlaybackLeaseRef::new("client|erin|9|hls|0123456789abcdef", PlaybackKind::LiveHls)),
+            )
+            .ok_or("alias holder")?;
+
+        let reentry = acquire_live_hls_from_lineup(&manager, &input, "client|alice|42|hls|fedcba9876543210", 50_011)?;
+        assert_eq!(reentry.allocation.get_provider_name(), Some(Arc::clone(&input)));
+        manager.release_handle(&reentry);
+        manager.release_handle(&alias_holder);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn live_hls_socket_cleanup_only_cancels_its_public_session() -> Result<(), String> {
         let app_cfg = create_test_app_config_with_pool(2, 4);
@@ -4891,11 +5704,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn live_hls_old_token_cleanup_cannot_mutate_rebound_retry() -> Result<(), String> {
-        let app_cfg = create_test_app_config_with_pool(2, 4);
-        let event_manager = Arc::new(EventManager::new());
-        let manager = ActiveProviderManager::new(&app_cfg, &event_manager);
-        let input = "provider_1".intern();
-        let alias = "provider_2".intern();
+        let (manager, input, alias) = alias_pool(2, 4);
         let old = "client|alice|42|hls|0123456789abcdef";
         let new = "client|alice|42|hls|fedcba9876543210";
         let addr = SocketAddr::from(([172, 18, 0, 9], 55_000));
@@ -5435,6 +6244,128 @@ mod tests {
         manager.release_handle(&handle);
         manager.release_connection(&SocketAddr::from(([127, 0, 0, 1], 47_001)));
         assert_eq!(manager.get_provider_connections_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_release_wakes_only_waiters_of_that_provider() {
+        use futures::FutureExt;
+        let app_cfg = create_test_app_config_with_dual_provider_pool();
+        let event_manager = Arc::new(EventManager::new());
+        let manager = ActiveProviderManager::new(&app_cfg, &event_manager);
+        let provider_1: Arc<str> = "provider_1".intern();
+        let provider_2: Arc<str> = "provider_2".intern();
+        let acquire = |provider: &Arc<str>, port: u16| {
+            manager
+                .acquire_exact_connection_with_lease_for_session(
+                    provider,
+                    &SocketAddr::from(([127, 0, 0, 1], port)),
+                    false,
+                    0,
+                    ConnectionKind::Normal,
+                    None,
+                )
+                .expect("slot available")
+        };
+        let handle_1 = acquire(&provider_1, 48_201);
+        let handle_2 = acquire(&provider_2, 48_202);
+
+        let notify = manager.provider_capacity_notify(&provider_1);
+        let woken = notify.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        manager.release_handle(&handle_2);
+        assert!(woken.as_mut().now_or_never().is_none(), "another provider's release must not wake the waiter");
+        manager.release_handle(&handle_1);
+        assert!(woken.as_mut().now_or_never().is_some(), "the waiter's provider release wakes it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_preempting_request_still_frees_the_victim_slot() {
+        let app_cfg = create_test_app_config_single_provider_pool();
+        let event_manager = Arc::new(EventManager::new());
+        let manager = Arc::new(ActiveProviderManager::new(&app_cfg, &event_manager));
+        let input_name: Arc<str> = "provider_1".intern();
+        let victim = manager
+            .acquire_connection_with_grace_for_session(
+                &input_name,
+                &SocketAddr::from(([127, 0, 0, 1], 48_111)),
+                false,
+                10,
+                ConnectionKind::Normal,
+                Some("session-victim"),
+            )
+            .expect("victim allocation succeeds");
+        manager.mark_opening(victim.allocation_id);
+        assert!(manager.register_body_owner(victim.allocation_id));
+
+        // The preempting request waits without deadline and is dropped (client disconnect).
+        let waiting = {
+            let manager = Arc::clone(&manager);
+            let input_name = Arc::clone(&input_name);
+            tokio::spawn(async move {
+                manager
+                    .acquire_exact_connection_with_lease_for_session_await(
+                        &input_name,
+                        &SocketAddr::from(([127, 0, 0, 1], 48_112)),
+                        false,
+                        0,
+                        ConnectionKind::Normal,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(victim.cancel_token.as_ref().is_some_and(tokio_util::sync::CancellationToken::is_cancelled));
+        waiting.abort();
+        assert!(waiting.await.is_err_and(|err| err.is_cancelled()));
+        assert_eq!(manager.get_provider_connections_count(), 1, "the draining victim keeps its slot for now");
+
+        tokio::time::sleep(super::PREEMPTION_COMPLETION_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(manager.get_provider_connections_count(), 0, "the reaper frees the never-completing victim");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_acquire_until_stops_at_deadline_and_still_forces_victim_release() {
+        let app_cfg = create_test_app_config_single_provider_pool();
+        let event_manager = Arc::new(EventManager::new());
+        let manager = Arc::new(ActiveProviderManager::new(&app_cfg, &event_manager));
+        let input_name: Arc<str> = "provider_1".intern();
+        let victim = manager
+            .acquire_connection_with_grace_for_session(
+                &input_name,
+                &SocketAddr::from(([127, 0, 0, 1], 48_101)),
+                false,
+                10,
+                ConnectionKind::Normal,
+                Some("session-victim"),
+            )
+            .expect("victim allocation succeeds");
+        manager.mark_opening(victim.allocation_id);
+        assert!(manager.register_body_owner(victim.allocation_id));
+
+        // The victim never completes its body, so only the deadline can end the wait.
+        let started = tokio::time::Instant::now();
+        let acquired = manager
+            .acquire_exact_connection_with_lease_for_session_until(
+                &input_name,
+                &SocketAddr::from(([127, 0, 0, 1], 48_102)),
+                false,
+                0,
+                ConnectionKind::Normal,
+                None,
+                Some(started + Duration::from_millis(100)),
+            )
+            .await;
+        assert!(acquired.is_none());
+        assert_eq!(started.elapsed(), Duration::from_millis(100), "the caller deadline bounds the wait");
+        assert!(victim.cancel_token.as_ref().is_some_and(tokio_util::sync::CancellationToken::is_cancelled));
+        assert_eq!(manager.get_provider_connections_count(), 1, "the draining victim keeps its slot for now");
+
+        tokio::time::sleep(super::PREEMPTION_COMPLETION_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert_eq!(manager.get_provider_connections_count(), 0, "the forced victim release still runs");
     }
 
     #[tokio::test]
