@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index b41e23f6..c336f191 100644
+index 4d6863d3..ca25a482 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -4871,6 +4871,7 @@ dependencies = [
@@ -202,7 +202,7 @@ index 02753392..f7ce8271 100644
                  }
              }
 diff --git a/backend/app/src/api/endpoints/xmltv_api.rs b/backend/app/src/api/endpoints/xmltv_api.rs
-index 896164ba..1ea02198 100644
+index a63fc644..32ea3424 100644
 --- a/backend/app/src/api/endpoints/xmltv_api.rs
 +++ b/backend/app/src/api/endpoints/xmltv_api.rs
 @@ -14,9 +14,10 @@ use crate::{
@@ -849,7 +849,7 @@ index 99c6feae..74dcb699 100644
      }
  }
 diff --git a/backend/repository/src/lib.rs b/backend/repository/src/lib.rs
-index 75614616..056e2be6 100644
+index b9d5d667..4bdbd5c8 100644
 --- a/backend/repository/src/lib.rs
 +++ b/backend/repository/src/lib.rs
 @@ -1,6 +1,7 @@
@@ -860,14 +860,14 @@ index 75614616..056e2be6 100644
  // A B+Tree-backed IPv4 lookup and a CLI dumper for the repository's databases.
  // Both read repository storage directly, so they belong here rather than in
  // `utils`, which must not depend on this layer.
-@@ -41,6 +42,7 @@ mod xtream_playlist_iterator;
+@@ -42,6 +43,7 @@ mod xtream_playlist_iterator;
  mod xtream_repository;
  
  pub use alias_repository::*;
 +pub use adult_epg_ids::*;
  pub use db_viewer::*;
+ pub use epg_group_index::*;
  pub use epg_repository::*;
- pub use geoip::*;
 diff --git a/backend/repository/src/m3u_playlist_iterator.rs b/backend/repository/src/m3u_playlist_iterator.rs
 index a1fda341..5fa11de5 100644
 --- a/backend/repository/src/m3u_playlist_iterator.rs
@@ -1082,7 +1082,7 @@ index d56ae619..8b4bd7e8 100644
          priority: 0,
          soft_connections,
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index 90fb5e6a..12ac7eb3 100644
+index a1ea313a..7fcf8bd8 100644
 --- a/frontend/public/assets/i18n/ar.json
 +++ b/frontend/public/assets/i18n/ar.json
 @@ -683,6 +683,7 @@
@@ -1093,7 +1093,7 @@ index 90fb5e6a..12ac7eb3 100644
        "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
      },
      "USER_PLAN": {
-@@ -1711,6 +1712,7 @@
+@@ -1712,6 +1713,7 @@
      "USER_STATUS_TRIAL": "تجريبي",
      "USER_UI": "واجهة المستخدم",
      "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
@@ -1102,7 +1102,7 @@ index 90fb5e6a..12ac7eb3 100644
      "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
      "USE_OUTPUT": "استخدام المخرج",
 diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index 50b1f88e..b9c0eae8 100644
+index 3b634d35..9e13f50c 100644
 --- a/frontend/public/assets/i18n/en.json
 +++ b/frontend/public/assets/i18n/en.json
 @@ -683,6 +683,7 @@
@@ -1113,7 +1113,7 @@ index 50b1f88e..b9c0eae8 100644
        "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
      },
      "USER_PLAN": {
-@@ -1779,6 +1780,7 @@
+@@ -1780,6 +1781,7 @@
      "USER_STATUS_TRIAL": "Trial",
      "USER_UI": "User UI",
      "USER_UI_ENABLED": "User-UI Enabled",
@@ -1122,7 +1122,7 @@ index 50b1f88e..b9c0eae8 100644
      "USE_MEMORY_CACHE": "Mem-Cache",
      "USE_OUTPUT": "Use output",
 diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index 02c5231a..ac13e0a1 100644
+index 9df44162..7db66c56 100644
 --- a/frontend/public/assets/i18n/ru.json
 +++ b/frontend/public/assets/i18n/ru.json
 @@ -683,6 +683,7 @@
@@ -1133,7 +1133,7 @@ index 02c5231a..ac13e0a1 100644
        "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
      },
      "USER_PLAN": {
-@@ -1697,6 +1698,7 @@
+@@ -1698,6 +1699,7 @@
      "USER_STATUS_TRIAL": "Пробный",
      "USER_UI": "Пользовательский UI",
      "USER_UI_ENABLED": "User-UI включен",
@@ -1142,7 +1142,7 @@ index 02c5231a..ac13e0a1 100644
      "USE_MEMORY_CACHE": "Mem-кэш",
      "USE_OUTPUT": "Использовать вывод",
 diff --git a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
-index e8730e9e..a2ee381d 100644
+index a290f483..9c135d40 100644
 --- a/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
 +++ b/frontend/src/app/components/userlist/proxy_user_credentials_form.rs
 @@ -160,6 +160,7 @@ generate_form_reducer!(
@@ -1161,7 +1161,7 @@ index e8730e9e..a2ee381d 100644
                          let now = Utc::now();
                          user.created_at = Some(now.timestamp());
                          let in_one_year = now + Duration::days(DEFAULT_EXPIRATION_DAYS);
-@@ -731,6 +733,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
+@@ -733,6 +735,7 @@ pub fn ProxyUserCredentialsForm(props: &ProxyUserCredentialsFormProps) -> Html {
              { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_TIMESHIFT"), epg_timeshift, UserFormAction::EpgTimeshift) }
              { edit_field_text_option!(form_state,  translate.t("LABEL.EPG_REQUEST_TIMESHIFT"), epg_request_timeshift, UserFormAction::EpgRequestTimeshift) }
              { edit_field_bool!(form_state,  translate.t("LABEL.USER_UI_ENABLED"), ui_enabled, UserFormAction::UiEnabled) }
