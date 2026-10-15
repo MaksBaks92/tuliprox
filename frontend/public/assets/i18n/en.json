@@ -1,4 +1,5 @@
 {
+  "HLS_STARTUP_MODE_DESCRIPTION": "Conservative keeps the existing startup behavior. First ready waits for a processed start segment. Progressive delivers raw TS and requires suitable sources; it takes effect for new sessions.",
   "BACKOFF_JITTER_PERCENT_VALIDATION": "Backoff jitter percent must be between 0 and 95.",
   "COUNTRY": {
     "AD": "Andorra",
@@ -257,6 +258,8 @@
   },
   "UNAUTHORIZED": "Not authorized",
   "EXPLANATION": {
+    "TABLE_COLUMNS_SHARED": "Use the switches to show or hide columns. Drag a handle to change the order. Save applies your changes; Restore defaults resets the layout.\n\nSpace or Enter picks up or drops a column. Use Up/Down to move; Escape cancels the move.\n\nThese settings are shared by everyone using this installation without authentication.",
+    "TABLE_COLUMNS": "Use the switches to show or hide columns. Drag a handle to change the order. Save applies your changes; Restore defaults resets the layout.\n\nSpace or Enter picks up or drops a column. Use Up/Down to move; Escape cancels the move.",
     "API_PROXY_CONFIG": {
       "USE_USER_DB": "If enabled, API proxy users are loaded from the user database.",
       "AUTH_ERROR_STATUS": "HTTP status code returned for authentication failures. Default is 403 (Forbidden)."
@@ -380,13 +383,14 @@
       "MAPPING": "List of mapping IDs to apply to this target.",
       "NAME": "Human readable name for this entry. Used for selective processing via -t CLI arg.",
       "USE_MEMORY_CACHE": "If enabled, the playlist is cached in RAM to reduce disk overhead (increases memory usage).",
-      "WATCH": "List of group patterns to monitor for changes. Notifications are sent via configured messaging."
+      "WATCH": "List of group patterns to monitor. Each pattern is a regular expression matched against the group name (e.g. ^Sport.* or (?i)event). Each entry reports channel changes, new groups and/or removed groups. Notifications are sent via configured messaging."
     },
     "CONFIG_TARGET_OPTIONS": {
-      "CLEAR_INVALID_EPG_IDS": "Clears EPG IDs that do not match the processed EPG data. Playlist entries are not removed.",
       "SHARE_LIVE_STREAMS": "Enables live stream sharing. The master toggle sets HLS and MPEG-TS together; each format can also be changed separately."
     },
     "EPG_OUTPUT_OPTIONS": {
+      "CLEAR_INVALID_IDS": "Clears EPG IDs that do not match the processed EPG data. Playlist entries are not removed.",
+      "ADOPT_GUIDE_ID_CASE": "Rewrites a playlist EPG id that matches a guide channel only case-insensitively to the guide's exact channel id, so playlist ids, XMLTV and EPG API lookups stay identical. Enabled by default; a full target refresh is required after changing this option.",
       "LOWERCASE_IDS": "Canonicalizes technical EPG IDs to ASCII lowercase across M3U, Xtream, XMLTV, and EPG API output. A full target refresh is required after changing this option.",
       "LOWERCASE_XMLTV_DISPLAY_NAMES": "Converts only XMLTV display-name text to Unicode lowercase. Playlist names and programme titles remain unchanged."
     },
@@ -865,6 +869,10 @@
       "SKIP_LIVE_DIRECT_SOURCE": "If enabled, live streams are not linked directly but proxied/resolved.",
       "SKIP_SERIES_DIRECT_SOURCE": "If enabled, series episodes are not linked directly but proxied/resolved.",
       "SKIP_VIDEO_DIRECT_SOURCE": "If enabled, VOD files are not linked directly but proxied/resolved."
+    },
+    "MAINTENANCE": {
+      "INPUT": "Input to take out of service. While it is in maintenance, new streams get the maintenance video and Tuliprox does not contact its provider; running streams and recordings continue.",
+      "REASON": "Optional remark shown in the maintenance list, for example why the provider is down. At most 500 characters."
     }
   },
   "HINT": {
@@ -902,6 +910,17 @@
     "WEB_ROOT": "Web-Root: Contains the web-ui files. They are normally placed in the same directory under ./web"
   },
   "LABEL": {
+    "HLS_STARTUP_LIMITS": "Fast start limits",
+    "HLS_PROGRESSIVE_SEGMENTS": "Maximum progressive segments",
+    "HLS_PROGRESSIVE_BYTES_PER_SEGMENT": "Replay memory per segment",
+    "HLS_PROGRESSIVE_BYTES_TOTAL": "Total replay memory",
+    "HLS_PROGRESSIVE_READER_LIFETIME": "Maximum reader lifetime (seconds)",
+    "HLS_DEFERRED_REPAIRS": "Maximum pending repair jobs",
+    "HLS_STARTUP_MODE": "HLS startup mode",
+    "HLS_STARTUP_MODE_CONSERVATIVE": "Conservative",
+    "HLS_STARTUP_MODE_FIRST_READY": "First ready",
+    "HLS_STARTUP_MODE_PROGRESSIVE": "Progressive",
+    "HLS_STARTUP_MODE_OPTIMISTIC": "Optimistic",
     "ALL_TARGETS": "All targets",
     "ACCEPT_INSECURE_SSL_CERTIFICATES": "Accept Insecure SSL Certificates",
     "ACTIVE": "Active",
@@ -925,6 +944,15 @@
     "ADD_PROPERTY": "Add Property",
     "ADD_PROVIDER": "Add Provider",
     "ADD_QUALITY_TO_FILENAME": "Quality",
+    "MAINTENANCE": "Maintenance",
+    "MAINTENANCE_ADD_ALL": "All into maintenance",
+    "MAINTENANCE_COUNT": "{count} inputs in maintenance",
+    "MAINTENANCE_COUNT_ONE": "1 input in maintenance",
+    "MAINTENANCE_NONE": "No input in maintenance",
+    "MAINTENANCE_REASON": "Remark",
+    "MAINTENANCE_REMOVE_ALL": "End all maintenance",
+    "MAINTENANCE_SINCE": "Since",
+    "MANAGE": "Manage",
     "USE_METADATA": "Use metadata",
     "ADD_SERVER": "Add Server",
     "ADD_PLAN": "Add Plan",
@@ -1198,6 +1226,7 @@
     "LOG_ACTIVE_USER": "Log Active User",
     "LOG_CONFIG": "Log",
     "LOG_LEVEL": "Log Level",
+    "ADOPT_GUIDE_EPG_ID_CASE": "Adopt guide EPG ID case",
     "LOWERCASE_EPG_IDS": "Lowercase EPG IDs",
     "LOWERCASE_XMLTV_DISPLAY_NAMES": "Lowercase XMLTV display names",
     "M3U": "m3u",
@@ -1271,6 +1300,7 @@
     "MPEG_TS": "MPEG-TS",
     "MSG_KIND_ERROR": "Error",
     "MSG_KIND_INFO": "Info",
+    "MSG_KIND_MAINTENANCE_CHANGED": "Maintenance Changed",
     "MSG_KIND_LIBRARY_SCAN_COMPLETED": "Library Scan Completed",
     "MSG_KIND_LIBRARY_SCAN_FAILED": "Library Scan Failed",
     "MSG_KIND_METADATA_UPDATE_COMPLETED": "Metadata Update Completed",
@@ -1793,6 +1823,9 @@
     "VOD": "VOD",
     "VOD_SHORT": "V",
     "WATCH": "Watch",
+    "WATCH_CHANNELS": "Channels",
+    "WATCH_GROUP_ADDED": "New groups",
+    "WATCH_GROUP_REMOVED": "Removed groups",
     "WEBHOOK_URL": "Webhook URL",
     "WEB_AUTH": "Auth",
     "WEB_ROOT": "Web-Root",
@@ -1921,6 +1954,11 @@
     "LOGIN": {
       "MESSAGE": "Enter Your Credentials",
       "FAILED": "Failed to login"
+    },
+    "MAINTENANCE": {
+      "LOAD_FAILED": "Could not load maintenance state",
+      "REASON_TOO_LONG": "The remark may have at most 500 characters",
+      "SAVE_FAILED": "Could not save maintenance state"
     },
     "SESSION": {
       "EXPIRED": "Your session has expired. Please log in again."
@@ -2251,5 +2289,51 @@
   },
   "TITLE": {
     "USER_BOUQUET_EDITOR": "Playlist Category Selection"
+  },
+  "TABLE_COLUMNS": {
+    "COLUMNS": "Columns",
+    "OPEN": "Customize table columns",
+    "TITLE": "Customize columns",
+    "ACTIONS": "Actions",
+    "CLOSE": "Close",
+    "REQUIRED": "Required",
+    "REORDER": "Reorder {column}",
+    "KEYBOARD_HELP": "Space or Enter picks up or drops a column. Use Up/Down to move; Escape cancels the move.",
+    "POSITION": "{column}, position {position} of {total}",
+    "RESET": "Restore defaults",
+    "CANCEL": "Cancel",
+    "SAVE": "Save",
+    "RETRY": "Retry",
+    "REAPPLY": "Apply my draft to the current version",
+    "CONFLICT": "This layout changed in another session. Your draft is preserved. Review and apply it again explicitly.",
+    "ERROR": "Settings could not be loaded or saved. Your draft is preserved.",
+    "LOAD_ERROR": "Table settings could not be loaded. Default columns are shown.",
+    "SHARED": "These settings are shared by everyone using this installation without authentication.",
+    "LIMIT": "This CSV has more than 256 columns. All columns remain visible; saving a layout is unavailable.",
+    "ERROR_INVALID": "The settings file is invalid. Correct it before saving.",
+    "ERROR_VERSION_UNSUPPORTED": "This settings file uses an unsupported version.",
+    "ERROR_OWNER_MISMATCH": "The settings file belongs to another identity.",
+    "ERROR_FILE_UNSAFE": "The settings path is not a regular file.",
+    "ERROR_LIMITS_EXCEEDED": "The settings limit was reached. No changes were saved.",
+    "ERROR_PAYLOAD_INVALID": "The column layout is invalid.",
+    "ERROR_ID_INVALID": "A table or column identifier is invalid.",
+    "ERROR_IO_ERROR": "The settings file could not be read or written.",
+    "TABLE_USERS": "Users",
+    "TABLE_PLAYLIST_INPUTS": "Playlist inputs",
+    "TABLE_PLAYLIST_TARGETS": "Playlist targets",
+    "TABLE_CONFIG_API_SERVERS": "API servers",
+    "TABLE_CONFIG_USER_PLANS": "User plans",
+    "TABLE_RBAC_USERS": "Web UI users",
+    "TABLE_RBAC_GROUPS": "Groups",
+    "TABLE_RECORDING_LIBRARY": "Recordings",
+    "TABLE_RECORDING_RULES": "Recording rules",
+    "TABLE_STREAM_HISTORY_RECORDS": "Stream history",
+    "TABLE_STREAM_HISTORY_PROVIDERS": "Provider summary",
+    "TABLE_STREAM_HISTORY_QOS_SUMMARY": "Quality summary",
+    "TABLE_STREAM_HISTORY_QOS_DETAILS": "Quality details",
+    "TABLE_CONFIG_LIBRARY_DIRECTORIES": "Library directories",
+    "TABLE_CONFIG_SCHEDULES": "Schedules",
+    "TABLE_RBAC_PERMISSION_MATRIX": "Permissions",
+    "TABLE_PLAYLIST_ACCOUNTS_CSV": "Accounts CSV"
   }
 }

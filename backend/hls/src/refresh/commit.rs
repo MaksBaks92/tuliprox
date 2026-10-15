@@ -176,6 +176,9 @@ pub(super) fn commit_fetched_manifest_with_acceptance_mode(
         ),
     };
     if result.is_ok() {
+        if matches!(session.mode, HlsSessionMode::TransientPassthrough { .. }) {
+            session.startup = None;
+        }
         clear_satisfied_fresh_manifest_requirement(session, request);
     }
     let configured_target_duration = session.target_duration;
@@ -274,6 +277,11 @@ fn commit_transient_fetched_manifest(
     fetch_finished_at_ms: u64,
     options: HlsTransientFetchedCommitOptions,
 ) -> Result<(HlsManifestCommitProgressEvidence, bool, bool), HlsManifestCommitError> {
+    if session.startup.is_some() && session.published_live_origin_baseline.is_some() {
+        return Err(HlsManifestCommitError::TimelineRejected {
+            reason: HlsManifestRejectLogReason::StartupRepresentationChange,
+        });
+    }
     let HlsTransientFetchedCommitOptions { acceptance_mode, reason, manifest_semantics, switch_metric } = options;
     let timeline = parse_transient_manifest_timeline_for_commit(session, &fetched.body)?;
     let quality = evaluate_manifest_acceptance_for_commit(
@@ -717,6 +725,7 @@ fn commit_transient_manifest(
         )?
     };
     session.transient.record_manifest_commit_identity(commit_identity);
+    session.record_origin_manifest_commit();
     session.record_manifest_commit_identity(commit_identity);
     session.transient.record_rolling_event_rewrite_seed(
         body,
@@ -843,7 +852,12 @@ fn commit_normal_manifest(
         session.advance_media_readiness_generation();
     } else {
         let apply_result = if sequence_relation == HlsManifestSequenceRelation::Rebase {
-            session.apply_origin_rebase_manifest(manifest, effective_host_id)
+            let retained_head_in_use = matches!(
+                session.account_binding_protection(rendered_at_ms),
+                crate::HlsAccountBindingProtection::HardActive { .. }
+                    | crate::HlsAccountBindingProtection::SoftActive { .. }
+            );
+            session.apply_origin_rebase_manifest(manifest, effective_host_id, retained_head_in_use)
         } else {
             session.apply_origin_manifest_for_host(manifest, effective_host_id)
         };
@@ -851,6 +865,7 @@ fn commit_normal_manifest(
             reason: HlsManifestRejectLogReason::from(err),
         })?;
     }
+    session.record_origin_manifest_commit();
     session.transient.upsert_resources(key_resources);
     session.initial_prefetch_gap_segments = initial_prefetch_gap_segments;
     if provisioning_handoff {

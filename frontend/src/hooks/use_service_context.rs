@@ -10,6 +10,7 @@ use yew::prelude::*;
 
 pub struct Services {
     pub auth: Rc<AuthService>,
+    pub user_settings: Rc<crate::services::UserSettingsService>,
     pub config: Rc<ConfigService>,
     pub user: Rc<UserService>,
     pub user_api: Rc<UserApiService>,
@@ -22,6 +23,7 @@ pub struct Services {
     pub websocket: Rc<WebSocketService>,
     pub rbac: Rc<RbacService>,
     pub flags: Rc<FlagsService>,
+    pub maintenance: Rc<crate::services::MaintenanceService>,
 }
 
 impl Services {
@@ -39,8 +41,11 @@ impl Services {
         let websocket = Rc::new(WebSocketService::new(Rc::clone(&status), Rc::clone(&event)));
         let rbac = Rc::new(RbacService::new());
         let flags = Rc::new(flags_service);
+        let user_settings = Rc::new(crate::services::UserSettingsService::new());
+        let maintenance = Rc::new(crate::services::MaintenanceService::new());
         Self {
             auth,
+            user_settings,
             config,
             user,
             user_api,
@@ -53,6 +58,7 @@ impl Services {
             websocket,
             rbac,
             flags,
+            maintenance,
         }
     }
 }

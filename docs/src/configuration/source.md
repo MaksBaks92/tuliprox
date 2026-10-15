@@ -1250,8 +1250,9 @@ sources:
         sort: { }
         options:
           ignore_logo: false
-          clear_invalid_epg_ids: false
           epg_output:
+            clear_invalid_ids: false
+            adopt_guide_id_case: true
             lowercase_ids: false
             lowercase_xmltv_display_names: false
           share_live_streams:
@@ -1293,7 +1294,7 @@ sources:
 | `output`           | List          |   Yes    |           | Mandatory list of output formats. A single target can generate multiple output representations (e.g., `xtream`, `m3u`, `strm`, `hdhomerun`) from the same transformed result set.                                            |
 | `curation`         | Object        |    No    |           | Optional target-wide catalog policy with Trakt and/or TMDB Trending sources. Mutually exclusive with legacy `output[].trakt`; see [target-wide curation](#target-wide-curation-curation).                                    |
 | `favourites`       | List          |    No    |           | Duplicates final transformed channels into dedicated favorite groups after processing is complete. This adds curated views without changing the original group structure.                                                    |
-| `watch`            | List          |    No    |           | Defines watched group patterns. If matching groups change during updates, Tuliprox emits Messaging events so operational changes become observable automatically.                                                            |
+| `watch`            | List          |    No    |           | Watch entries for this target: channel changes in matching groups and/or matching groups that appear or disappear. Changes are reported as Messaging events; see [Watch](#329-watch-watch).                                  |
 | `use_memory_cache` | Bool          |    No    | `false`   | If enabled, the final compiled playlist is cached in RAM. This reduces disk access and improves delivery speed, especially for M3U downloads, but increases memory consumption.                                              |
 
 ---
@@ -1365,7 +1366,7 @@ Tuliprox supports the following filter expression types:
   * Case-insensitivity is ASCII-only: ASCII letters match regardless of case, non-ASCII characters must match
     exactly. `Title CONTAINS "cinéma"` matches `Cinéma` but not `CINÉMA`.
 * Presence comparison: `EpgId IS EMPTY` matches a missing or empty field; `EpgId IS NOT EMPTY` matches a populated field.
-  This is especially useful in a `persist` filter after `clear_invalid_epg_ids` has removed unresolved EPG IDs.
+  This is especially useful in a `persist` filter after `epg_output.clear_invalid_ids` has removed unresolved EPG IDs.
   `EpgId = EMPTY` and `EpgId != EMPTY` are accepted as aliases and normalize to the `IS` forms.
 * Set membership (case-insensitive exact match against a list): `Group IN ["Sports", "News"]`
 * Numeric comparison on the channel number: `Chno = 5`, `Chno != 5`, `Chno > 100`, `Chno >= 100`, `Chno < 200`, `Chno <= 200`
@@ -1606,8 +1607,9 @@ targets:
         use_output: xtream
     options:
       ignore_logo: false
-      clear_invalid_epg_ids: false
       epg_output:
+        clear_invalid_ids: false
+        adopt_guide_id_case: true
         lowercase_ids: true
         lowercase_xmltv_display_names: false
       share_live_streams:
@@ -1625,11 +1627,12 @@ targets:
 | Parameter                                  | Type | Required | Default | Technical Impact & Background                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 |:-------------------------------------------|:-----|:--------:|:--------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ignore_logo`                              | Bool |    No    | `false` | Ignores `tvg-logo` and `tvg-logo-small` attributes. This reduces downstream device-side logo caching and can keep generated M3U playlists leaner for clients with limited storage or poor cache invalidation behavior.                                                                                                                                                                                                                                                                                                                                                                            |
-| `clear_invalid_epg_ids`                    | Bool |    No    | `false` | Clears an EPG ID when it does not resolve to the processed EPG data. Playlist entries are never removed. Smart matching runs first, and IDs introduced or changed by later mappings are validated again before the `persist` filter. The legacy input name `required_epg` is still accepted, but configuration is serialized with the new name.                                                                                                                                                                                                                                                   |
 | `share_live_streams.hls`                   | Bool |    No    | `false` | Enables HLS live sharing for the new HLS cache proxy path. This is a configuration switch for the HLS cache feature and is independent from MPEG-TS stream sharing.                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `share_live_streams.mpeg_ts`               | Bool |    No    | `false` | Allows Tuliprox to share MPEG-TS live stream connections in reverse proxy mode. This can reduce upstream provider connection usage when multiple clients watch the same channel, but it increases memory usage per shared channel.                                                                                                                                                                                                                                                                                                                                                                |
 | `remove_duplicates`                        | Bool |    No    | `false` | Legacy pre-transform identity deduplication. It runs independently for each input before the F/R/M pipe and removes repeated source identities before mapping can emit additional items. The field remains supported for backward compatibility.                                                                                                                                                                                                                                                                                                                                                  |
 | `deduplicate`                              | Map  |    No    | -       | Post-merge, quality-aware content deduplication. It runs after all inputs have been transformed and merged. Channels whose match value is identical after stripping quality tokens (`4K`, `UHD`, `2160p`, `QHD`, `1440p`, `FHD`, `1080p`, `HD`, `720p`, `SD`, `480p`, `576p`) collapse to one entry. Sub-keys: `match_by` (`caption` (default), `name`, `title`), `keep` (`best_quality` (default), `first`) and `match_as_ascii` (default `false`). Matching is per cluster across all groups; ties keep the first occurrence. This lets mappings affect the final duplicate comparison results. |
+| `epg_output.clear_invalid_ids`             | Bool |    No    | `false` | Clears an EPG ID when it does not resolve to the processed EPG data. Playlist entries are never removed. Smart matching runs first, and IDs introduced or changed by later mappings are validated again before the `persist` filter.                                                                                                                                                                                                                                                                                                                                                              |
+| `epg_output.adopt_guide_id_case`           | Bool |    No    | `true`  | Rewrites a live channel EPG id that matches a guide channel only case-insensitively (for example `usa4k.us` against `<channel id="USA4K.us">`) to the guide's exact spelling, so the M3U `tvg-id`, Xtream `epg_channel_id`, XMLTV `<channel id>` and EPG API lookups use the same id. Set `false` to keep the playlist's original spelling. Changing this option requires a full target refresh.                                                                                                                                                                                                  |
 | `epg_output.lowercase_ids`                 | Bool |    No    | `false` | Canonicalizes visible technical EPG IDs with ASCII lowercase across M3U `tvg-id`, Xtream `epg_channel_id`, XMLTV channel/programme references, and EPG API responses. Changing this option requires a full target refresh.                                                                                                                                                                                                                                                                                                                                                                        |
 | `epg_output.lowercase_xmltv_display_names` | Bool |    No    | `false` | Applies Unicode lowercase exclusively to XMLTV `<display-name>` values during serialization. Playlist names, Xtream names, programme titles, and programme descriptions remain unchanged; persisted target data does not require rebuilding.                                                                                                                                                                                                                                                                                                                                                      |
 | `force_redirect`                           | Bool |    No    | `false` | Optional redirect-related behavior switch. This influences how Tuliprox serves final stream delivery where redirect-style output handling is required by the deployment model.                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -1672,8 +1675,9 @@ targets:
 
 #### EPG Output Normalization
 
-`epg_output` applies to the entire target so every output format uses the same EPG identity space. Both options
-default to `false`; when they are omitted, Tuliprox preserves the source casing and existing output behavior.
+`epg_output` applies to the entire target so every output format uses the same EPG identity space. The two
+lowercase options default to `false`. `adopt_guide_id_case` defaults to `true`, so even when every option is omitted,
+a live channel id that matches a guide channel only case-insensitively is rewritten to the guide id's exact casing.
 
 ```yaml
 targets:
@@ -2275,25 +2279,44 @@ favourites:
 
 ### 3.2.9 Watch (`watch`)
 
-For each target with a *unique name*, you can define watched groups.
-It is a list of group patterns Tuliprox monitors for content changes during updates.
+For each target with a *unique name*, you can define watch entries. Each entry is a regex matched against final group
+names and says which changes to report:
 
-If matching groups gain or lose channels, Tuliprox emits a Messaging event such as:
+| `on` value      | Reported change                                                |
+|:----------------|:---------------------------------------------------------------|
+| `channels`      | Channels added to or removed from a matching group.            |
+| `group_added`   | A matching group appeared that was not in the previous update. |
+| `group_removed` | A group that matched in the previous update is gone.           |
 
-* channels added
-* channels removed
+An entry is either a plain string, which means `on: [channels]`, or a map with `pattern` and `on`:
 
 ```yaml
 watch:
-  - group: '^Sports'
-  - group: '^Movies'
+  # Short form: channel changes in all German sports groups.
+  - "^DE Sport.*"
+  # Report new 4K/UHD groups only.
+  - pattern: "(?i)\\b(4K|UHD)\\b"
+    on: [group_added]
+  # Report every group that disappears.
+  - pattern: ".*"
+    on: [group_removed]
+  # Event groups: appearing, disappearing and their channel changes.
+  - pattern: "^Event.*|^PPV.*"
+    on: [channels, group_added, group_removed]
 ```
+
+The first update of a target only records the current state; changes are reported from the second update on. All
+changes of one update arrive as a single `playlist.watch.changed` event.
+
+A `playlist.watch.unmatched` warning is sent for entries that watch `channels` (without `group_added`) and match no
+group. Entries waiting for a group to appear, or reporting only removals, never trigger it.
 
 #### `watch` Parameters
 
-| Parameter | Type           | Required | Default | Technical Impact & Background                                                                                                                                                                                              |
-|:----------|:---------------|:--------:|:--------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `group`   | String (Regex) |   Yes    |         | Regex pattern matched against final group names. This allows Tuliprox to detect meaningful content changes in selected areas of the playlist and notify operators automatically through the configured messaging backends. |
+| Parameter | Type           | Required | Default      | Technical Impact & Background                                         |
+|:----------|:---------------|:--------:|:-------------|:----------------------------------------------------------------------|
+| `pattern` | String (Regex) |   Yes    |              | Regex matched against final group names.                              |
+| `on`      | List           |    No    | `[channels]` | Any of `channels`, `group_added`, `group_removed`. Must not be empty. |
 
 > **Note:** `watch` is especially useful for monitoring premium groups, VOD collections,
 > or unstable provider segments where additions and removals should generate operational alerts.

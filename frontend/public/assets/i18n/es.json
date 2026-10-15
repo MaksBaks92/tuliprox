@@ -1,4 +1,5 @@
 {
+  "HLS_STARTUP_MODE_DESCRIPTION": "Conservador mantiene el comportamiento de inicio existente. Primero listo espera un segmento inicial procesado. Progresivo entrega TS sin procesar y requiere fuentes adecuadas; se aplica a las sesiones nuevas.",
   "BACKOFF_JITTER_PERCENT_VALIDATION": "El porcentaje de fluctuación (jitter) del retroceso debe estar entre 0 y 95.",
   "COUNTRY": {
     "AD": "Andorra",
@@ -257,6 +258,8 @@
   },
   "UNAUTHORIZED": "No autorizado",
   "EXPLANATION": {
+    "TABLE_COLUMNS_SHARED": "Usa los interruptores para mostrar u ocultar columnas. Arrastra el tirador para cambiar el orden. Guardar aplica los cambios; Restaurar valores predeterminados restablece el diseño.\n\nEspacio o Intro toma o suelta una columna. Usa Arriba/Abajo para moverla; Escape cancela el movimiento.\n\nEstos ajustes son compartidos por todos los usuarios de esta instalación sin autenticación.",
+    "TABLE_COLUMNS": "Usa los interruptores para mostrar u ocultar columnas. Arrastra el tirador para cambiar el orden. Guardar aplica los cambios; Restaurar valores predeterminados restablece el diseño.\n\nEspacio o Intro toma o suelta una columna. Usa Arriba/Abajo para moverla; Escape cancela el movimiento.",
     "API_PROXY_CONFIG": {
       "USE_USER_DB": "Si está habilitado, los usuarios del proxy API se cargan desde la base de datos de usuarios.",
       "AUTH_ERROR_STATUS": "Código de estado HTTP devuelto para errores de autenticación. El valor por defecto es 403 (Forbidden)."
@@ -380,13 +383,14 @@
       "MAPPING": "Lista de ID de mapeo a aplicar a este destino.",
       "NAME": "Nombre legible para este elemento. Se utiliza para el procesamiento selectivo mediante el argumento CLI -t.",
       "USE_MEMORY_CACHE": "Si está habilitado, la lista de reproducción se guarda en caché en RAM para reducir la sobrecarga de disco (aumenta el uso de memoria).",
-      "WATCH": "Lista de patrones de grupo a monitorizar para detectar cambios. Las notificaciones se envían mediante la mensajería configurada."
+      "WATCH": "Lista de patrones de grupo a monitorizar. Cada patrón es una expresión regular que se compara con el nombre del grupo (p. ej. ^Sport.* o (?i)event). Cada entrada informa de cambios de canales, grupos nuevos y/o grupos eliminados. Las notificaciones se envían mediante la mensajería configurada."
     },
     "CONFIG_TARGET_OPTIONS": {
-      "CLEAR_INVALID_EPG_IDS": "Borra los ID de EPG que no coinciden con los datos de EPG procesados. Las entradas de la lista de reproducción no se eliminan.",
       "SHARE_LIVE_STREAMS": "Habilita el uso compartido de streams en directo. El interruptor maestro activa HLS y MPEG-TS juntos; cada formato también se puede cambiar por separado."
     },
     "EPG_OUTPUT_OPTIONS": {
+      "CLEAR_INVALID_IDS": "Borra los ID de EPG que no coinciden con los datos de EPG procesados. Las entradas de la lista de reproducción no se eliminan.",
+      "ADOPT_GUIDE_ID_CASE": "Reescribe un ID de EPG de la lista que coincide con un canal de la guía solo sin distinguir mayúsculas con el ID exacto del canal de la guía, para que los ID de la lista, XMLTV y las consultas de la API de EPG sean idénticos. Activado por defecto; se requiere una actualización completa del destino tras cambiar esta opción.",
       "LOWERCASE_IDS": "Canoniza los ID técnicos de EPG a minúsculas ASCII en la salida M3U, Xtream, XMLTV y la API de EPG. Se requiere una actualización completa del destino tras cambiar esta opción.",
       "LOWERCASE_XMLTV_DISPLAY_NAMES": "Convierte solo el texto de display-name de XMLTV a minúsculas Unicode. Los nombres de la lista de reproducción y los títulos de programas no se modifican."
     },
@@ -865,6 +869,10 @@
       "SKIP_LIVE_DIRECT_SOURCE": "Si está habilitado, los streams en directo no se enlazan directamente sino que se proxyfican/resuelven.",
       "SKIP_SERIES_DIRECT_SOURCE": "Si está habilitado, los episodios de series no se enlazan directamente sino que se proxyfican/resuelven.",
       "SKIP_VIDEO_DIRECT_SOURCE": "Si está habilitado, los archivos VOD no se enlazan directamente sino que se proxyfican/resuelven."
+    },
+    "MAINTENANCE": {
+      "INPUT": "Entrada que se retira del servicio. Mientras está en mantenimiento, las nuevas reproducciones reciben el vídeo de mantenimiento y Tuliprox no contacta con su proveedor; las reproducciones y grabaciones en curso continúan.",
+      "REASON": "Observación opcional que se muestra en la lista de mantenimiento, por ejemplo por qué el proveedor no está disponible. Máximo 500 caracteres."
     }
   },
   "HINT": {
@@ -902,6 +910,17 @@
     "WEB_ROOT": "Web-Root: contiene los archivos de la interfaz web. Normalmente se colocan en el mismo directorio bajo ./web"
   },
   "LABEL": {
+    "HLS_STARTUP_LIMITS": "Límites de inicio rápido",
+    "HLS_PROGRESSIVE_SEGMENTS": "Máximo de segmentos progresivos",
+    "HLS_PROGRESSIVE_BYTES_PER_SEGMENT": "Memoria de búfer por segmento",
+    "HLS_PROGRESSIVE_BYTES_TOTAL": "Memoria de búfer total",
+    "HLS_PROGRESSIVE_READER_LIFETIME": "Vida máxima del lector (segundos)",
+    "HLS_DEFERRED_REPAIRS": "Máximo de reparaciones pendientes",
+    "HLS_STARTUP_MODE": "Modo de inicio HLS",
+    "HLS_STARTUP_MODE_CONSERVATIVE": "Conservador",
+    "HLS_STARTUP_MODE_FIRST_READY": "Primero listo",
+    "HLS_STARTUP_MODE_PROGRESSIVE": "Progresivo",
+    "HLS_STARTUP_MODE_OPTIMISTIC": "Optimista",
     "ALL_TARGETS": "Todos los destinos",
     "ACCEPT_INSECURE_SSL_CERTIFICATES": "Aceptar certificados SSL no seguros",
     "ACTIVE": "Activo",
@@ -925,6 +944,15 @@
     "ADD_PROPERTY": "Añadir propiedad",
     "ADD_PROVIDER": "Añadir proveedor",
     "ADD_QUALITY_TO_FILENAME": "Calidad",
+    "MAINTENANCE": "Mantenimiento",
+    "MAINTENANCE_ADD_ALL": "Todas a mantenimiento",
+    "MAINTENANCE_COUNT": "{count} entradas en mantenimiento",
+    "MAINTENANCE_COUNT_ONE": "1 entrada en mantenimiento",
+    "MAINTENANCE_NONE": "Ninguna entrada en mantenimiento",
+    "MAINTENANCE_REASON": "Observación",
+    "MAINTENANCE_REMOVE_ALL": "Terminar todo el mantenimiento",
+    "MAINTENANCE_SINCE": "Desde",
+    "MANAGE": "Gestionar",
     "USE_METADATA": "Usar metadatos",
     "ADD_SERVER": "Añadir servidor",
     "ADD_PLAN": "Añadir plan",
@@ -1198,6 +1226,7 @@
     "LOG_ACTIVE_USER": "Registrar usuario activo",
     "LOG_CONFIG": "Registro",
     "LOG_LEVEL": "Nivel de registro",
+    "ADOPT_GUIDE_EPG_ID_CASE": "Adoptar mayúsculas del ID de la guía EPG",
     "LOWERCASE_EPG_IDS": "ID de EPG en minúsculas",
     "LOWERCASE_XMLTV_DISPLAY_NAMES": "Nombres de visualización XMLTV en minúsculas",
     "M3U": "m3u",
@@ -1271,6 +1300,7 @@
     "MPEG_TS": "MPEG-TS",
     "MSG_KIND_ERROR": "Error",
     "MSG_KIND_INFO": "Info",
+    "MSG_KIND_MAINTENANCE_CHANGED": "Mantenimiento de entrada cambiado",
     "MSG_KIND_LIBRARY_SCAN_COMPLETED": "Escaneo de biblioteca completado",
     "MSG_KIND_LIBRARY_SCAN_FAILED": "Escaneo de biblioteca fallido",
     "MSG_KIND_METADATA_UPDATE_COMPLETED": "Actualización de metadatos completada",
@@ -1793,6 +1823,9 @@
     "VOD": "VOD",
     "VOD_SHORT": "V",
     "WATCH": "Vigilancia",
+    "WATCH_CHANNELS": "Canales",
+    "WATCH_GROUP_ADDED": "Grupos nuevos",
+    "WATCH_GROUP_REMOVED": "Grupos eliminados",
     "WEBHOOK_URL": "URL del webhook",
     "WEB_AUTH": "Autenticación",
     "WEB_ROOT": "Web-Root",
@@ -1921,6 +1954,11 @@
     "LOGIN": {
       "MESSAGE": "Introduzca sus credenciales",
       "FAILED": "No se pudo iniciar sesión"
+    },
+    "MAINTENANCE": {
+      "LOAD_FAILED": "No se pudo cargar el estado de mantenimiento",
+      "REASON_TOO_LONG": "La observación puede tener como máximo 500 caracteres",
+      "SAVE_FAILED": "No se pudo guardar el estado de mantenimiento"
     },
     "SESSION": {
       "EXPIRED": "Su sesión ha expirado. Por favor, inicie sesión de nuevo."
@@ -2251,5 +2289,51 @@
   },
   "TITLE": {
     "USER_BOUQUET_EDITOR": "Selección de categorías de la lista de reproducción"
+  },
+  "TABLE_COLUMNS": {
+    "COLUMNS": "Columnas",
+    "OPEN": "Personalizar columnas de la tabla",
+    "TITLE": "Personalizar columnas",
+    "ACTIONS": "Acciones",
+    "CLOSE": "Cerrar",
+    "REQUIRED": "Obligatorio",
+    "REORDER": "Reordenar {column}",
+    "KEYBOARD_HELP": "Espacio o Intro toma o suelta una columna. Usa Arriba/Abajo para moverla; Escape cancela el movimiento.",
+    "POSITION": "{column}, posición {position} de {total}",
+    "RESET": "Restaurar valores predeterminados",
+    "CANCEL": "Cancelar",
+    "SAVE": "Guardar",
+    "RETRY": "Reintentar",
+    "REAPPLY": "Aplicar mi borrador a la versión actual",
+    "CONFLICT": "Este diseño cambió en otra sesión. Se conserva tu borrador. Revísalo y vuelve a aplicarlo explícitamente.",
+    "ERROR": "No se pudieron cargar o guardar los ajustes. Se conserva tu borrador.",
+    "LOAD_ERROR": "No se pudieron cargar los ajustes de la tabla. Se muestran las columnas predeterminadas.",
+    "SHARED": "Estos ajustes son compartidos por todos los usuarios de esta instalación sin autenticación.",
+    "LIMIT": "Este CSV tiene más de 256 columnas. Todas siguen visibles; no se puede guardar un diseño.",
+    "ERROR_INVALID": "El archivo de ajustes no es válido. Corrígelo antes de guardar.",
+    "ERROR_VERSION_UNSUPPORTED": "La versión del archivo de ajustes no es compatible.",
+    "ERROR_OWNER_MISMATCH": "El archivo de ajustes pertenece a otra identidad.",
+    "ERROR_FILE_UNSAFE": "La ruta de ajustes no es un archivo normal.",
+    "ERROR_LIMITS_EXCEEDED": "Se alcanzó el límite de ajustes. No se guardaron cambios.",
+    "ERROR_PAYLOAD_INVALID": "El diseño de columnas no es válido.",
+    "ERROR_ID_INVALID": "Un identificador de tabla o columna no es válido.",
+    "ERROR_IO_ERROR": "No se pudo leer o escribir el archivo de ajustes.",
+    "TABLE_USERS": "Usuarios",
+    "TABLE_PLAYLIST_INPUTS": "Entradas de listas",
+    "TABLE_PLAYLIST_TARGETS": "Destinos de listas",
+    "TABLE_CONFIG_API_SERVERS": "Servidores API",
+    "TABLE_CONFIG_USER_PLANS": "Planes de usuario",
+    "TABLE_RBAC_USERS": "Usuarios de la interfaz web",
+    "TABLE_RBAC_GROUPS": "Grupos",
+    "TABLE_RECORDING_LIBRARY": "Grabaciones",
+    "TABLE_RECORDING_RULES": "Reglas de grabación",
+    "TABLE_STREAM_HISTORY_RECORDS": "Historial de streams",
+    "TABLE_STREAM_HISTORY_PROVIDERS": "Resumen de proveedores",
+    "TABLE_STREAM_HISTORY_QOS_SUMMARY": "Resumen de calidad",
+    "TABLE_STREAM_HISTORY_QOS_DETAILS": "Detalles de calidad",
+    "TABLE_CONFIG_LIBRARY_DIRECTORIES": "Directorios de la biblioteca",
+    "TABLE_CONFIG_SCHEDULES": "Programaciones",
+    "TABLE_RBAC_PERMISSION_MATRIX": "Permisos",
+    "TABLE_PLAYLIST_ACCOUNTS_CSV": "CSV de cuentas"
   }
 }

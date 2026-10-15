@@ -18,6 +18,7 @@ mod ip_check;
 mod item_field;
 mod library_request;
 mod log;
+mod maintenance;
 mod mapping;
 mod media_properties;
 mod messaging;
@@ -28,7 +29,6 @@ mod pagination;
 mod playlist;
 mod playlist_categories;
 mod playlist_document;
-mod playlist_groups_changed;
 mod playlist_info_document;
 mod playlist_request;
 mod playlist_update_run;
@@ -69,6 +69,7 @@ mod ui_playlist_item;
 mod user_command;
 mod user_id;
 mod user_lifecycle;
+mod user_settings;
 mod uuidtype;
 pub mod view_type;
 mod watch_health;
@@ -79,9 +80,9 @@ pub mod xtream_const;
 pub use self::{
     active_user_connection_change::*, auth::*, auth_audit::*, cluster_flags::*, config::*, connection_denied::*,
     custom_video_stream_type::*, epg::*, epg_grid::*, epg_request::*, event::*, input_refresh_policy::*,
-    input_update_action::*, ip_check::*, item_field::*, library_request::*, log::*, mapping::*, media_properties::*,
-    messaging::*, metadata_update_failure::*, notification::*, notification_dead_letter::*, pagination::*, playlist::*,
-    playlist_categories::*, playlist_groups_changed::*, playlist_info_document::*, playlist_request::*,
+    input_update_action::*, ip_check::*, item_field::*, library_request::*, log::*, maintenance::*, mapping::*,
+    media_properties::*, messaging::*, metadata_update_failure::*, notification::*, notification_dead_letter::*,
+    pagination::*, playlist::*, playlist_categories::*, playlist_info_document::*, playlist_request::*,
     playlist_update_run::*, playlist_update_status::*, processing_order::*, progress::*, provider_fetch_failure::*,
     provider_pool::*, recording::*, recording_math::*, regex_cache::*, resource::*, scheduled_task_failure::*,
     search_fields::*, search_request::*, server_lifecycle::*, short_epg::*, stalker::*, stalker_item::*, stats::*,
@@ -92,3 +93,4 @@ pub use self::{
 };
 pub use ids::*;
 pub use prepare::*;
+pub use user_settings::*;

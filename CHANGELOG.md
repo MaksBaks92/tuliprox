@@ -4,6 +4,37 @@
 
 ## ⚠️ Breaking Changes
 
+- **Web UI sessions must sign in again once.** The new maintenance permissions bump the permission schema, so tokens
+  issued before the update are rejected with `X-Token-Refresh: required` and the Web UI returns to the sign-in page.
+
+- **`playlist.watch.changed` carries every watch change of one update.** The payload is now
+  `{ target, changes: [...] }`, where each change has a `kind` (`groups_added`, `groups_removed`, `channels_added`,
+  `channels_removed`). Templates using `{{watch.group}}`, `{{watch.added}}` or `{{watch.removed}}` must be updated:
+
+  ```handlebars
+  {{!-- before --}}
+  {{watch.group}}: {{#each watch.added}}{{this}} {{/each}}
+  {{!-- after --}}
+  {{#each watch.channels_added}}{{group}}: {{#each items}}{{this}} {{/each}}{{/each}}
+  ```
+
+- **`clear_invalid_epg_ids` moved to `epg_output.clear_invalid_ids`.** The target option now sits next to the other
+  EPG id output options. The top-level `options.clear_invalid_epg_ids` and its legacy alias `options.required_epg` are
+  rejected while loading. To migrate, move the value:
+
+  ```yaml
+  options:
+    epg_output:
+      clear_invalid_ids: true
+  ```
+
+  In the Web UI the toggle is now part of the **EPG Output** group of the target options.
+
+- **Recordings use the local API listener.** `api.host` must resolve locally to the
+  listener; wildcard binds use loopback. `web_ui.player_server` and public `api-proxy.yml`
+  servers no longer select recording capture URLs. Recording headers now apply to the
+  provider request, including HLS follow-ups. See [DVR](docs/src/operator/dvr.md).
+
 - **`video.download` is now `video.recording`, and VOD/series downloads are recordings.** Live
   captures and VOD/series transfers share one queue and one configuration block. A configuration
   that still contains `video.download` is rejected while loading. To migrate:
@@ -155,6 +186,29 @@
 
 ## 🌟 New Features
 
+- **Maintenance mode.** Inputs can be put into maintenance from the new dashboard card or through
+  `/api/v1/maintenance` (`*` addresses all inputs). New streams of an input in maintenance get the new
+  `maintenance.ts` custom video; playlist and EPG updates keep the last persisted state, and probes, metadata
+  resolution, Stalker refreshes and DVR starts do not contact the provider. Running streams and recordings continue.
+  The state is stored in `maintenance.json` and survives restarts. New permissions `maintenance.read` and
+  `maintenance.write`. See [Maintenance mode](docs/src/rest-api-cookbook.md#maintenance-mode).
+- **Optional fast start for shared live HLS.** `reverse_proxy.hls_cache.startup.mode` selects `conservative`
+  (default, unchanged behavior), `first_ready` (admits playback after one processed start segment) or `progressive`
+  (streams the raw TS start segment while the shared origin fill is still running). Progressive replay memory,
+  reader lifetime and deferred repairs are bounded by the new `startup` limits; revision files share the existing
+  disk cache limits. Archive, encrypted and fMP4/MAP sessions keep the existing path. The Web UI exposes the mode
+  and its limits. See [Optional startup modes](docs/src/configuration/shared-hls-configuration.md#optional-startup-modes).
+- **Optimistic fast start for shared live HLS.** `startup.mode: optimistic` works like `progressive`, but publishes
+  the first playlist as soon as the head segment has data and its successors were accepted by the origin, instead
+  of waiting for data from three segments. Successor fetches start together with the head. Opt-in; the default
+  stays `conservative`.
+
+- **Personal Web UI table layouts.** Show or hide optional columns, reorder them with mouse, touch, or keyboard,
+  and save layouts per account. Restore defaults, cancel drafts, and resolve conflicting saves without losing edits.
+  Settings are stored under `<config_path>/user_settings/`; installations without Web UI authentication share one layout.
+  The `/api/v1/me/settings` endpoints expose the caller's preferences with ETag-based updates.
+  Accounts CSV layouts are scoped to their header schema. See [Personal table layouts](docs/src/features.md#personal-table-layouts).
+
 - **Target-owned discovery with TMDB Trending.** `target.curation` combines optional Trakt and TMDB sources under one
   `full`/`curated` policy. TMDB supports movie/TV day/week feeds with a unique-reference `limit` (default 100, range
   1..=500) and guarded internal pagination. It uses its own Bearer token, exact same-kind TMDB-ID matching, and optional
@@ -287,16 +341,12 @@
     layer to stop discarding the distinction: an empty `Some` is now load-bearing and means "configured and unusable",
     which is not the same as "not configured". `playlist.watch.unmatched` covers the fourth silence — a pattern matching
     no group looks exactly like a group that has not changed, so a typo in `watch` was invisible.
-  - **`playlist.groups.changed`**: `watch` tracked channels inside named groups and was blind to the group set itself,
-    in both directions. A group appearing was silent — no baseline file, so one was written, nothing was emitted, and
-    the group's entire channel list read as "not new" from then on — and a group vanishing was worse, since it is absent
-    from the refreshed playlist and no code path observed the disappearance at all. The target's group titles are now
-    diffed against a persisted index before the per-group fan-out, so it sees every group rather than only the ones the
-    watch patterns name; the question is which groups exist, not what is inside the watched ones. The index sits beside
-    the per-group directory (`<target>.groups.bin`, not `<target>/__groups.bin`) so it cannot collide with a group whose
-    sanitized title matches, and first sight writes the baseline silently — announcing every existing group as new on
-    the first refresh after an upgrade would be noise. Gated on `target.watch` being configured, so it costs nothing for
-    targets that never asked to be watched.
+  - **Watch group contexts**: a `watch` entry can be a map with `pattern` and `on` (`channels`, `group_added`,
+    `group_removed`), so groups appearing in or vanishing from a target are reported, filtered per entry. Plain string
+    entries keep watching channels only. The target's group titles are diffed against a persisted index
+    (`<target>.groups.bin`) that always holds every group, so editing a pattern never reads as a change; first sight
+    writes the baseline silently. Group changes arrive in `playlist.watch.changed`; the short-lived
+    `playlist.groups.changed` event is gone and its name is accepted as an alias.
   - **`metadata.update.failed` for an input whose tasks burn through their retries**: the completion event only fires
     when a cycle drains *with changes*, and an exhausted task only reached a `debug!`, so an input whose resolves fail
     every time emitted a start and then nothing for as long as it stayed broken — on the bus, indistinguishable from one
@@ -914,6 +964,11 @@
 
 ## ⚙️ Optimizations
 
+- **Shared table column metadata.** Column enums define stable IDs, labels, and display/sort behavior across Web UI
+  tables. Metadata is memoized, header observers persist across renders, and layout drafts and validation avoid redundant
+  clones and sets. Settings filenames build hash prefixes only when needed while preserving existing encoded names;
+  subject validation and Bearer parsing reuse the common identity and authentication types.
+
 - **The effective admission strategy list is carried as `Arc<[AdmissionStrategy]>`**: `GraceResolutionContext` is
   stored on `StreamInfo` and travels with every clone of it, so a `Vec<AdmissionStrategy>` field meant reallocating the
   list on each clone — and `get_effective_admission_strategies` handed back a fresh `Vec` that the context builder then
@@ -1058,6 +1113,30 @@
   the `shared` crate, so `/ready` and the banner can no longer drift apart in how they group inputs and aliases.
 
 ## 🐛 Fixes
+
+- **Long Telegram and ntfy notifications are no longer rejected.** Telegram accepts at most 4096 characters (UTF-16
+  units) and ntfy 4096 bytes per message; neither channel had a limit, so a large watch or statistics notification
+  failed and landed in the dead letter queue. Telegram now cuts the final text, after `MarkdownV2` escaping, and drops
+  an escape that the cut separated from its character; ntfy bodies are truncated like Pushover's.
+- **Short EPG and player guides stay empty when playlist and XMLTV ids differ only in case.** A live channel whose
+  EPG id matches a guide channel case-insensitively (for example `usa4k.us` against `<channel id="USA4K.us">`) now
+  adopts the guide's spelling, so the playlist `tvg-id` / `epg_channel_id`, the XMLTV `<channel id>` and the EPG db
+  key are identical. Previously the exact `get_short_epg` lookup and case-sensitive players missed these channels
+  unless `epg_output.lowercase_ids` was enabled. Affected ids change their visible case after the next target update.
+  The new target option `epg_output.adopt_guide_id_case` (default `true`, also in the Web UI target options) keeps
+  the playlist's original spelling when set to `false`.
+
+- **Shared HLS retries an origin account reserved for another session.** A bound account that is briefly reserved
+  by a competing session or an in-flight binding handoff is now retried within the existing acquire budget instead
+  of failing the segment fetch immediately. Ownership checks and rebinding rules are unchanged; a permanently
+  foreign reservation fails once that budget is spent.
+
+- **Shared HLS recovers from missing segments at the head of a new live window.** HTTP 404/410 responses for the
+  first segments of an unpublished live window advance the startup head instead of blocking the initial playlist.
+
+- **Table pagination and settings errors.** Pagination clamps navigation and page ranges to valid bounds and rejects
+  unsupported page sizes. Internal settings task failures return HTTP 500; oversized request bodies return HTTP 413,
+  while other body read failures return HTTP 400. Account and token checks remain active after waiting for settings locks.
 
 - **Proxied live HLS keeps its provider account when the client IP changes.** A player that refreshes its playlist
   from alternating client IPs (dual-stack IPv4/IPv6, WLAN/mobile switching behind a reverse proxy) created a new
@@ -1677,6 +1756,8 @@
 
 ## 🛠 Maintenance
 
+- **`ClusterFlags` is built on `create_bitset!`.** It was the last user of the `bitflags` crate, which is removed
+  from `shared`. The API and the persisted `[live,vod]` form are unchanged.
 - **Testkit scenarios can pause and tune reconnect windows.** A step with only `pause_millis` (1 to 300000) idles the
   scenario, and `policy_contract` accepts `hls_session_ttl_secs` and `provider_affinity_ttl_secs`. The new scenario
   `m3u-hls-provider-affinity-after-lease-expiry` uses both to prove that a returning HLS playback stays on its

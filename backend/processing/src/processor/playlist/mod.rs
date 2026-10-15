@@ -3,10 +3,13 @@ use crate::{
     fetched_playlist::FetchedPlaylist,
     input_cache,
     metadata_sink::{MetadataUpdateSink, NoopMetadataSink},
-    parser::xmltv::{flatten_tvguide, merge_epg_trees, EpgMergeAccumulator, TVGuide},
-    playlist_watch::{process_group_watch, process_target_groups_watch},
+    parser::xmltv::{flatten_tvguide, merge_epg_trees, EpgMergeAccumulator},
+    playlist_watch::{assemble_watch_changes, diff_target_groups, process_group_watch},
     processor::{
-        epg::{clear_invalid_live_epg_ids, process_playlist_epg, retain_epg_referenced_by_groups},
+        epg::{
+            adopt_guide_live_epg_id_case, clear_invalid_live_epg_ids, process_playlist_epg,
+            retain_epg_referenced_by_groups, EpgAssignOptions,
+        },
         sort::sort_playlist,
         xtream_series::playlist_resolve_series,
         xtream_vod::playlist_resolve_vod,
@@ -18,22 +21,18 @@ use indexmap::IndexMap;
 use log::{debug, error, info, log_enabled, warn, Level};
 use path_clean::PathClean;
 use shared::{
-    concat_string,
     defaults::{default_as_default, default_probe_delay_secs, default_probe_live_interval},
     error::{get_errors_notify_message, TuliproxError},
     foundation::{get_field_value, set_field_value, Filter, ValueAccessor, ValueProvider},
     model::{
         ClusterFlags, ConfigTargetOptions, CounterModifier, EventMessage, EventSink, FieldGet, FieldSet,
         InputRefreshOverride, InputRefreshPolicy, InputStats, InputType, InputUpdateAction, InputUpdateRequest,
-        MappingStage, PersistedPlaylistUpdateClusterSnapshot, PersistedPlaylistUpdateQualityDecision,
-        PersistedPlaylistUpdateQualitySnapshot, PersistedPlaylistUpdateTechnicalState, PipelineStats, PlaylistEntry,
-        PlaylistGroup, PlaylistItem, PlaylistItemType, PlaylistStats, PlaylistUpdateClusterDecision,
-        PlaylistUpdateClusterTelemetry, PlaylistUpdateDataSource, PlaylistUpdateInputTelemetry,
-        PlaylistUpdateProgressEvent, PlaylistUpdateRunId, PlaylistUpdateRunOrder, PlaylistUpdateState,
-        PlaylistUpdateSummary, ProviderFetchFailure, SourceStats, StagedInputType, StreamProperties, TargetStats,
-        UUIDType, WatchDisabled, WatchDisabledReason, WatchUnmatched, XtreamCluster,
+        MappingStage, PipelineStats, PlaylistEntry, PlaylistGroup, PlaylistItem, PlaylistItemType,
+        PlaylistUpdateInputTelemetry, PlaylistUpdateProgressEvent, PlaylistUpdateRunId, PlaylistUpdateRunOrder,
+        PlaylistUpdateState, PlaylistUpdateSummary, StreamProperties, TargetStats, UUIDType, WatchContext,
+        WatchDisabled, WatchDisabledReason, WatchUnmatched, XtreamCluster,
     },
-    utils::{create_alias_uuid, interner_gc, sanitize_sensitive_info, Internable},
+    utils::{create_alias_uuid, interner_gc, Internable},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -43,35 +42,25 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{watch, Mutex, OwnedRwLockWriteGuard, RwLock},
+    sync::{watch, Mutex, RwLock},
     task::JoinSet,
 };
 use tuliprox_core::{
     model::{
         is_valid, retain_filtered_playlist, AppConfig, ClusterForceUpdate, ClusterUpdateRejection, CompiledMapping,
-        ConfigFavourites, ConfigInput, ConfigInputFlags, ConfigInputOptions, ConfigRename, ConfigTarget,
-        CurationConfig, Epg, FilterOutcome, MappingProgram, ProcessTargets, ProviderIdType, ResolveReason,
-        ReverseProxyDisabledHeaderConfig, TransformStage, UpdateGuard, UpdateTask,
+        ConfigFavourites, ConfigInputFlags, ConfigInputOptions, ConfigRename, ConfigTarget, CurationConfig, Epg,
+        FilterOutcome, MappingProgram, ProcessTargets, ProviderIdType, ResolveReason, ReverseProxyDisabledHeaderConfig,
+        TransformStage, UpdateGuard, UpdateTask,
     },
-    utils::{debug_if_enabled, log_memory_snapshot, trace_if_enabled, StepMeasure, StepMeasureCallback},
+    utils::{debug_if_enabled, log_memory_snapshot, trace_if_enabled, StepMeasure},
 };
 use tuliprox_curation::{
     evaluate_curation, project_curation_categories, CurationEvaluation, CurationFailure, CurationRunOutcome,
     SelectorOutcome,
 };
-use tuliprox_iptv::{
-    epg::{CountingEpgSink, EpgFetchRequest, EpgProvider},
-    error::ProviderErrorKind,
-    provider::{
-        BatchContainerProvider, M3uProvider, PlaylistFetch, PlaylistFetchRequest, PlaylistProvider,
-        UnsupportedProvider, XtreamProvider,
-    },
-    xtream,
-};
 use tuliprox_repository::{
-    load_input_playlist, persist_input_playlist_with_options, persist_playlist_views, CategoryKey,
-    InputPlaylistPersistOptions, MemoryPlaylistSource, PlaylistPublicationPlan, PlaylistSource, PlaylistStorageState,
-    TargetPlaylistPersistOptions,
+    persist_playlist_views, CategoryKey, MemoryPlaylistSource, PlaylistPublicationPlan, PlaylistSource,
+    PlaylistStorageState, TargetPlaylistPersistOptions,
 };
 use tuliprox_session::ActiveProviderManager;
 
@@ -157,6 +146,7 @@ pub struct ProcessingRun<
     acquired_permit: Option<tuliprox_core::model::UpdateGuardPermit>,
     input_refresh: Option<InputRefreshOverride>,
     library_update_mode: LibraryUpdateMode,
+    maintenance: Option<Arc<dyn tuliprox_core::model::MaintenanceGate>>,
 }
 
 impl<E: EventSink + Clone + 'static> ProcessingRun<E, NoBootstrap, NoopMetadataSink> {
@@ -189,6 +179,7 @@ impl<E: EventSink + Clone + 'static> ProcessingRun<E, NoBootstrap, NoopMetadataS
             acquired_permit: None,
             input_refresh: None,
             library_update_mode: LibraryUpdateMode::ExistingCatalog,
+            maintenance: None,
         }
     }
 }
@@ -216,6 +207,7 @@ impl<E: EventSink + Clone + 'static, B: UpdateBootstrap, M: MetadataUpdateSink> 
             acquired_permit: self.acquired_permit,
             input_refresh: self.input_refresh,
             library_update_mode: self.library_update_mode,
+            maintenance: self.maintenance,
         }
     }
 
@@ -266,6 +258,7 @@ impl<E: EventSink + Clone + 'static, B: UpdateBootstrap, M: MetadataUpdateSink> 
             acquired_permit: self.acquired_permit,
             input_refresh: self.input_refresh,
             library_update_mode: self.library_update_mode,
+            maintenance: self.maintenance,
         }
     }
 
@@ -302,6 +295,13 @@ impl<E: EventSink + Clone + 'static, B: UpdateBootstrap, M: MetadataUpdateSink> 
         self
     }
 
+    /// Inputs taken out of service; their provider is not contacted during this run.
+    #[must_use]
+    pub fn with_maintenance<G: tuliprox_core::model::MaintenanceGate + 'static>(mut self, gate: Arc<G>) -> Self {
+        self.maintenance = Some(gate);
+        self
+    }
+
     /// Applies one manual policy override without changing the input configuration.
     #[must_use]
     pub fn with_input_refresh(mut self, input_refresh: impl Into<Option<InputRefreshOverride>>) -> Self {
@@ -330,6 +330,7 @@ pub async fn exec_processing<E: EventSink + Clone + 'static, B: UpdateBootstrap,
         acquired_permit,
         input_refresh,
         library_update_mode,
+        maintenance,
     } = run;
 
     let max_update_duration = Duration::from_secs(PLAYLIST_UPDATE_MAX_DURATION_SECS);
@@ -407,6 +408,7 @@ pub async fn exec_processing<E: EventSink + Clone + 'static, B: UpdateBootstrap,
         had_quality_rejections: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         input_refresh,
         library_update_mode,
+        maintenance,
     };
 
     let start_time = Instant::now();

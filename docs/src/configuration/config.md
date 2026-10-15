@@ -269,7 +269,8 @@ playlist_manager:playlist.read,playlist.write,source.read
 
 Available Permissions: `config.read/write`, `source.read/write`, `user.read/write`, `playlist.read/write`,
 `library.read/write`,
-`system.read/write`, `epg.read/write`, `recording.read/create/manage/delete`. Note: Write does not imply Read. A group must explicitly
+`system.read/write`, `epg.read/write`, `recording.read/create/manage/delete`, `maintenance.read/write`.
+Note: Write does not imply Read. A group must explicitly
 grant both if users need
 to view
 and edit content.
@@ -415,11 +416,10 @@ schedules:
 
 ## 5. Messaging (`messaging`)
 
-Tuliprox can proactively notify you via Push-Notifications when updates fail, finish, or when specific channels are
-added/removed
-from a watched group. **Why is this useful?** Because it allows you to instantly detect upstream provider issues or
-simply let you
-know when new movies are added to your playlist.
+Tuliprox can proactively notify you via Push-Notifications when updates fail, finish, when channels are added to or
+removed from a watched group, or when watched groups appear or disappear (see
+[`watch`](source.md#329-watch-watch)). **Why is this useful?** Because it allows you to instantly detect upstream
+provider issues, or simply let you know when new movies or a new event group are added to your playlist.
 
 ### 5.1 Configuration & Opt-In
 
@@ -458,8 +458,7 @@ negative pattern does, so `["*", "!system.info"]` reads the way it looks.
 | `system.shutdown` | info | The server is shutting down cleanly. |
 | `playlist.update.completed` | info | A playlist update finished; carries per-source statistics. |
 | `playlist.update.failed` | error | A playlist update failed. |
-| `playlist.watch.changed` | info | Channels were added to or removed from a watched group. |
-| `playlist.groups.changed` | info | Groups were added to or removed from a target. |
+| `playlist.watch.changed` | info | Channels or groups were added to or removed from a watched target. |
 | `playlist.watch.disabled` | warn | A target's watch configuration is set but not working. |
 | `playlist.watch.unmatched` | warn | Watch patterns matched no group in the refreshed playlist. |
 | `recording.started` | info | A recording started. |
@@ -483,6 +482,7 @@ negative pattern does, so `["*", "!system.info"]` reads the way it looks.
 | `user.connection.denied` | warn | A user was refused a connection because their limits were full. |
 | `recording.queue.changed` | info | The recording queue changed. |
 | `recording.rules.changed` | info | The recording rule set changed. |
+| `maintenance.changed` | warn | An input was put into or taken out of maintenance mode. |
 | `scheduled_task.failed` | error | A scheduled task could not complete. |
 | `notification.dead_lettered` | error | A notification was permanently undeliverable and has been dropped. |
 | `user.created` | info | An API-proxy user account was created. |
@@ -701,11 +701,31 @@ The legacy keys below continue to work exactly as before, so existing templates 
   task. It includes data on memory allocation peaks, active worker threads, and non-blocking diagnostic warnings.
   * **Access:** Access properties directly via dot-notation (e.g., `{{processing.memory_peak_mb}}`). Use this to
     monitor system health and resource consumption during heavy mapping cycles.
-* `{{watch}}`: **Change Tracking Data.** Specifically available for the `watch` event kind. It contains a diff-style
-  object showing exactly which groups or channels were added, removed, or modified compared to the previous state.
-  * **Access:** Iterate over the change sets using loops. Common keys include `added`, `removed`, and `modified`.
-  * **Example:** Use `{{#each watch.added}} • {{name}} {{/each}}` to list all new channels detected in the monitored
-    groups.
+* `{{watch}}`: **Change Tracking Data.** Available for `playlist.watch.changed`. One event per target and update.
+  * `watch.target`: the target name.
+  * `watch.groups_added` / `watch.groups_removed`: `{ items, total, truncated }`, absent when there is none.
+  * `watch.channels_added` / `watch.channels_removed`: list of `{ group, items, total, truncated }`, absent when
+    there is none.
+  * `watch.changes`: the raw list; each entry has a `kind` (`groups_added`, `groups_removed`, `channels_added`,
+    `channels_removed`).
+  * `items` may be shorter than `total` (`truncated: true`), or empty when an update changed more than 500 channels.
+  * **Example:**
+
+    ```handlebars
+    {{#if watch.groups_added}}
+    🆕 New groups:
+    {{#each watch.groups_added.items}}
+    • {{this}}
+    {{/each}}
+    {{/if}}
+    {{#each watch.channels_added}}
+    ➕ {{group}} ({{total}}):
+    {{#each items}}
+    • {{this}}
+    {{/each}}
+    {{/each}}
+    ```
+
 * `{{recording}}`: **DVR Lifecycle Data.** Available for `recording_started`, `recording_completed`, and
   `recording_failed`. Common fields are `programme_title`, `channel`, `effective_start`, `effective_end`,
   `visibility`, `output_filename`, and `failure_reason` for failed recordings.
@@ -1179,6 +1199,7 @@ custom_stream_response_timeout_secs: 20
 * `user_account_expired.ts` (User's `exp_date` reached)
 * `panel_api_provisioning.ts` (Loops while a new Provider Account is generated via Panel API)
 * `hls_session_or_lease_expired.ts` (Shared-HLS session or access lease expired; restart stream)
+* `maintenance.ts` (The input is in maintenance mode; see [Maintenance mode](../rest-api-cookbook.md#maintenance-mode))
 
 > **Note**: These Video files are all available in the docker image.
 

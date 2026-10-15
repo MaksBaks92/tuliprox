@@ -80,6 +80,12 @@ pub async fn update_app_state_sources(
     };
     app_state.playlist_updates.forced_targets.store(targets);
     let updates = app_state.set_sources(sources)?;
+    let known = app_state.known_input_names();
+    let known: Vec<&str> = known.iter().map(AsRef::as_ref).collect();
+    if let Err(err) = app_state.publish_maintenance(app_state.maintenance.retain_known(&known).await) {
+        // The reload itself succeeded; a stale entry only matches an input that no longer exists.
+        error!("Could not persist pruned maintenance state: {err}");
+    }
     update_target_caches(app_state, updates.targets.as_ref()).await;
     restart_services(app_state, &updates);
     Ok(())
@@ -176,7 +182,7 @@ fn start_services(app_state: &Arc<AppState>, changes: &UpdateChanges) {
             let app_state = Arc::clone(app_state);
             tokio::spawn(async move {
                 for _ in 0..50 {
-                    if !*app_state.recordings.worker_running.read().await {
+                    if !app_state.recordings.workers_running().await {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;

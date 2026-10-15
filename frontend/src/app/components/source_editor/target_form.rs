@@ -1,8 +1,9 @@
+use super::WatchEntriesEditor;
 use crate::{
     app::components::{
-        build_options, config::HasFormData, select::Select, selection_parse_first, AppIcon, BlockId, BlockInstance,
-        Card, ClusterFlagsInput, ClusterFlagsInputMode, DropDownSelection, EditMode, FilterInput, IconButton, Panel,
-        SourceEditorContext, TextButton, ToggleSwitch,
+        build_options, config::HasFormData, dto_field_id, select::Select, selection_parse_first, AppIcon, BlockId,
+        BlockInstance, Card, ClusterFlagsInput, ClusterFlagsInputMode, DropDownSelection, EditMode, FilterInput,
+        IconButton, Panel, SourceEditorContext, TextButton, ToggleSwitch,
     },
     config_field, config_field_bool, config_field_child, config_field_custom, edit_field_bool, edit_field_list_option,
     edit_field_text, generate_form_reducer,
@@ -14,7 +15,8 @@ use shared::{
     error::TuliproxError,
     model::{
         permission::Permission, ClusterFlags, ConfigTargetDto, ConfigTargetFilterDto, ConfigTargetOptions,
-        CurationCatalogSelection, CurationConfigDto, ProcessingOrder, TargetBouquetMode, TargetBouquetStatusDto,
+        ConfigWatchDto, CurationCatalogSelection, CurationConfigDto, ProcessingOrder, TargetBouquetMode,
+        TargetBouquetStatusDto,
     },
     utils::Internable,
 };
@@ -31,7 +33,6 @@ const LABEL_PERSIST_FILTER: &str = "LABEL.PERSIST_FILTER";
 const LABEL_MAPPING: &str = "LABEL.MAPPING";
 const LABEL_WATCH: &str = "LABEL.WATCH";
 const LABEL_ADD_MAPPING: &str = "LABEL.ADD_MAPPING";
-const LABEL_ADD_WATCH: &str = "LABEL.ADD_WATCH";
 const LABEL_USE_MEMORY_CACHE: &str = "LABEL.USE_MEMORY_CACHE";
 const LABEL_PROCESSING_ORDER: &str = "LABEL.PROCESSING_ORDER";
 const LABEL_IGNORE_LOGO: &str = "LABEL.IGNORE_LOGO";
@@ -42,6 +43,7 @@ const LABEL_MPEG_TS: &str = "LABEL.MPEG_TS";
 const LABEL_REMOVE_DUPLICATES: &str = "LABEL.REMOVE_DUPLICATES";
 const LABEL_FORCE_REDIRECT: &str = "LABEL.FORCE_REDIRECT";
 const LABEL_EPG_OUTPUT: &str = "LABEL.EPG_OUTPUT";
+const LABEL_ADOPT_GUIDE_EPG_ID_CASE: &str = "LABEL.ADOPT_GUIDE_EPG_ID_CASE";
 const LABEL_LOWERCASE_EPG_IDS: &str = "LABEL.LOWERCASE_EPG_IDS";
 const LABEL_LOWERCASE_XMLTV_DISPLAY_NAMES: &str = "LABEL.LOWERCASE_XMLTV_DISPLAY_NAMES";
 const LABEL_MAIN: &str = "LABEL.MAIN_CONFIG";
@@ -76,11 +78,15 @@ fn curation_summary(curation: &CurationConfigDto, catalog_selection: &str) -> St
 enum TargetFormPage {
     Main,
     Options,
+    Mapping,
+    Watch,
 }
 
 impl TargetFormPage {
     const MAIN: &str = "Main";
     const OPTIONS: &str = "Options";
+    const MAPPING: &str = "Mapping";
+    const WATCH: &str = "Watch";
 }
 
 impl FromStr for TargetFormPage {
@@ -90,6 +96,8 @@ impl FromStr for TargetFormPage {
         match s {
             Self::MAIN => Ok(TargetFormPage::Main),
             Self::OPTIONS => Ok(TargetFormPage::Options),
+            Self::MAPPING => Ok(TargetFormPage::Mapping),
+            Self::WATCH => Ok(TargetFormPage::Watch),
             _ => Err(TuliproxError::Config(format!("Unknown target form page: {s}"))),
         }
     }
@@ -100,6 +108,8 @@ impl Display for TargetFormPage {
         match *self {
             TargetFormPage::Main => write!(f, "{}", TargetFormPage::MAIN),
             TargetFormPage::Options => write!(f, "{}", TargetFormPage::OPTIONS),
+            TargetFormPage::Mapping => write!(f, "{}", TargetFormPage::MAPPING),
+            TargetFormPage::Watch => write!(f, "{}", TargetFormPage::WATCH),
         }
     }
 }
@@ -109,6 +119,8 @@ impl Internable for TargetFormPage {
         match self {
             Self::Main => TargetFormPage::MAIN,
             Self::Options => TargetFormPage::OPTIONS,
+            Self::Mapping => TargetFormPage::MAPPING,
+            Self::Watch => TargetFormPage::WATCH,
         }
         .intern()
     }
@@ -140,6 +152,7 @@ pub enum ConfigTargetOptionsFormAction {
     ShareLiveStreamsHls(bool),
     ShareLiveStreamsMpegTs(bool),
     RemoveDuplicates(bool),
+    AdoptGuideEpgIdCase(bool),
     LowercaseEpgIds(bool),
     LowercaseXmltvDisplayNames(bool),
     ForceRedirect(Option<ClusterFlags>),
@@ -159,7 +172,7 @@ impl yew::prelude::Reducible for ConfigTargetOptionsFormState {
                 modified = true;
             }
             ConfigTargetOptionsFormAction::ClearInvalidEpgIds(value) => {
-                form.clear_invalid_epg_ids = value;
+                form.epg_output.clear_invalid_ids = value;
                 modified = true;
             }
             ConfigTargetOptionsFormAction::ShareLiveStreamsHls(value) => {
@@ -172,6 +185,10 @@ impl yew::prelude::Reducible for ConfigTargetOptionsFormState {
             }
             ConfigTargetOptionsFormAction::RemoveDuplicates(value) => {
                 form.remove_duplicates = value;
+                modified = true;
+            }
+            ConfigTargetOptionsFormAction::AdoptGuideEpgIdCase(value) => {
+                form.epg_output.adopt_guide_id_case = value;
                 modified = true;
             }
             ConfigTargetOptionsFormAction::LowercaseEpgIds(value) => {
@@ -205,7 +222,7 @@ generate_form_reducer!(
         ProcessingOrder => processing_order: ProcessingOrder,
         Filter => filter: ConfigTargetFilterDto,
         Mapping => mapping: Option<Vec<String>>,
-        Watch => watch: Option<Vec<String>>,
+        Watch => watch: Option<Vec<ConfigWatchDto>>,
         UseMemoryCache => use_memory_cache: bool,
     }
 );
@@ -325,32 +342,50 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                     </div>
                 }
             };
-        let render_epg_output =
-            |readonly: bool, lowercase_ids_on_change: Callback<bool>, lowercase_names_on_change: Callback<bool>| {
-                html! {
-                    <div class="tp__target-options__group">
-                        <div class="tp__target-options__heading">
-                            <span class="tp__form-field__label">{ translate.t(LABEL_EPG_OUTPUT) }</span>
-                        </div>
-                        <div class="tp__target-options__children">
-                            { target_option_toggle(
-                                translate.t(LABEL_LOWERCASE_EPG_IDS),
-                                "EPG_OUTPUT_OPTIONS.LOWERCASE_IDS",
-                                target_options_state.form.epg_output.lowercase_ids,
-                                readonly,
-                                lowercase_ids_on_change,
-                            ) }
-                            { target_option_toggle(
-                                translate.t(LABEL_LOWERCASE_XMLTV_DISPLAY_NAMES),
-                                "EPG_OUTPUT_OPTIONS.LOWERCASE_XMLTV_DISPLAY_NAMES",
-                                target_options_state.form.epg_output.lowercase_xmltv_display_names,
-                                readonly,
-                                lowercase_names_on_change,
-                            ) }
-                        </div>
+        let epg_output_on_change = |action: fn(bool) -> ConfigTargetOptionsFormAction| {
+            let target_options_state = target_options_state.clone();
+            Callback::from(move |value| target_options_state.dispatch(action(value)))
+        };
+        let render_epg_output = |readonly: bool| {
+            let epg_output = &target_options_state.form.epg_output;
+            html! {
+                <div class="tp__target-options__group">
+                    <div class="tp__target-options__heading">
+                        <span class="tp__form-field__label">{ translate.t(LABEL_EPG_OUTPUT) }</span>
                     </div>
-                }
-            };
+                    <div class="tp__target-options__children">
+                        { target_option_toggle(
+                            translate.t(LABEL_CLEAR_INVALID_EPG_IDS),
+                            "EPG_OUTPUT_OPTIONS.CLEAR_INVALID_IDS",
+                            epg_output.clear_invalid_ids,
+                            readonly,
+                            epg_output_on_change(ConfigTargetOptionsFormAction::ClearInvalidEpgIds),
+                        ) }
+                        { target_option_toggle(
+                            translate.t(LABEL_ADOPT_GUIDE_EPG_ID_CASE),
+                            "EPG_OUTPUT_OPTIONS.ADOPT_GUIDE_ID_CASE",
+                            epg_output.adopt_guide_id_case,
+                            readonly,
+                            epg_output_on_change(ConfigTargetOptionsFormAction::AdoptGuideEpgIdCase),
+                        ) }
+                        { target_option_toggle(
+                            translate.t(LABEL_LOWERCASE_EPG_IDS),
+                            "EPG_OUTPUT_OPTIONS.LOWERCASE_IDS",
+                            epg_output.lowercase_ids,
+                            readonly,
+                            epg_output_on_change(ConfigTargetOptionsFormAction::LowercaseEpgIds),
+                        ) }
+                        { target_option_toggle(
+                            translate.t(LABEL_LOWERCASE_XMLTV_DISPLAY_NAMES),
+                            "EPG_OUTPUT_OPTIONS.LOWERCASE_XMLTV_DISPLAY_NAMES",
+                            epg_output.lowercase_xmltv_display_names,
+                            readonly,
+                            epg_output_on_change(ConfigTargetOptionsFormAction::LowercaseXmltvDisplayNames),
+                        ) }
+                    </div>
+                </div>
+            }
+        };
         if props.allow_write {
             let share_live_hls_on_change = {
                 let target_options_state = target_options_state.clone();
@@ -364,23 +399,11 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                     target_options_state.dispatch(ConfigTargetOptionsFormAction::ShareLiveStreamsMpegTs(value));
                 })
             };
-            let lowercase_epg_ids_on_change = {
-                let target_options_state = target_options_state.clone();
-                Callback::from(move |value| {
-                    target_options_state.dispatch(ConfigTargetOptionsFormAction::LowercaseEpgIds(value));
-                })
-            };
-            let lowercase_xmltv_display_names_on_change = {
-                let target_options_state = target_options_state.clone();
-                Callback::from(move |value| {
-                    target_options_state.dispatch(ConfigTargetOptionsFormAction::LowercaseXmltvDisplayNames(value));
-                })
-            };
             html! {
                 <Card class="tp__config-view__card">
                 <div class="tp__target-options">
                     { edit_field_bool!(target_options_state, translate.t(LABEL_IGNORE_LOGO), ignore_logo,  ConfigTargetOptionsFormAction::IgnoreLogo) }
-                    { edit_field_bool!(target_options_state, translate.t(LABEL_CLEAR_INVALID_EPG_IDS), clear_invalid_epg_ids, ConfigTargetOptionsFormAction::ClearInvalidEpgIds) }
+                    { edit_field_bool!(target_options_state, translate.t(LABEL_REMOVE_DUPLICATES), remove_duplicates, ConfigTargetOptionsFormAction::RemoveDuplicates) }
                     <div class="tp__target-options__group">
                         <div class="tp__target-options__heading">
                             <span class="tp__form-field__label">{ translate.t(LABEL_SHARE_LIVE_STREAMS) }</span>
@@ -402,12 +425,7 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                             ) }
                         </div>
                     </div>
-                    { edit_field_bool!(target_options_state, translate.t(LABEL_REMOVE_DUPLICATES), remove_duplicates, ConfigTargetOptionsFormAction::RemoveDuplicates) }
-                    { render_epg_output(
-                        false,
-                        lowercase_epg_ids_on_change,
-                        lowercase_xmltv_display_names_on_change,
-                    ) }
+                    { render_epg_output(false) }
                     <div class="tp__target-options__group">
                         <div class="tp__target-options__heading">
                             <span class="tp__form-field__label">{ translate.t(LABEL_FORCE_REDIRECT) }</span>
@@ -433,7 +451,7 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                 <Card class="tp__config-view__card">
                     <div class="tp__target-options">
                         { config_field_bool!(target_options_state.form, translate.t(LABEL_IGNORE_LOGO), ignore_logo) }
-                        { config_field_bool!(target_options_state.form, translate.t(LABEL_CLEAR_INVALID_EPG_IDS), clear_invalid_epg_ids) }
+                        { config_field_bool!(target_options_state.form, translate.t(LABEL_REMOVE_DUPLICATES), remove_duplicates) }
                         <div class="tp__target-options__group">
                             <div class="tp__target-options__heading">
                                 <span class="tp__form-field__label">{ translate.t(LABEL_SHARE_LIVE_STREAMS) }</span>
@@ -455,8 +473,7 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                                 ) }
                             </div>
                         </div>
-                        { config_field_bool!(target_options_state.form, translate.t(LABEL_REMOVE_DUPLICATES), remove_duplicates) }
-                        { render_epg_output(true, Callback::noop(), Callback::noop()) }
+                        { render_epg_output(true) }
                         <div class="tp__target-options__group">
                             <div class="tp__target-options__heading">
                                 <span class="tp__form-field__label">{ translate.t(LABEL_FORCE_REDIRECT) }</span>
@@ -570,8 +587,6 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                             options={processing_orders.clone()}
                         />
                    }})}
-                { edit_field_list_option!(target_form_state, translate.t(LABEL_MAPPING), mapping, ConfigTargetFormAction::Mapping, translate.t(LABEL_ADD_MAPPING)) }
-                { edit_field_list_option!(target_form_state, translate.t(LABEL_WATCH), watch, ConfigTargetFormAction::Watch, translate.t(LABEL_ADD_WATCH)) }
                 </Card>
             }
         } else {
@@ -595,16 +610,48 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                         translate.t(LABEL_PROCESSING_ORDER),
                         target_form_state.form.processing_order.to_string()
                     ) }
-                    { config_field_custom!(
-                        translate.t(LABEL_MAPPING),
-                        target_form_state.form.mapping.as_ref().map_or_else(String::new, |values| values.join(", "))
-                    ) }
-                    { config_field_custom!(
-                        translate.t(LABEL_WATCH),
-                        target_form_state.form.watch.as_ref().map_or_else(String::new, |values| values.join(", "))
-                    ) }
                 </Card>
             }
+        }
+    };
+
+    let render_mapping = || {
+        if props.allow_write {
+            html! {
+                <Card class="tp__config-view__card">
+                { edit_field_list_option!(target_form_state, translate.t(LABEL_MAPPING), mapping, ConfigTargetFormAction::Mapping, translate.t(LABEL_ADD_MAPPING)) }
+                </Card>
+            }
+        } else {
+            html! {
+                <Card class="tp__config-view__card">
+                { config_field_custom!(
+                    translate.t(LABEL_MAPPING),
+                    target_form_state.form.mapping.as_ref().map_or_else(String::new, |values| values.join(", "))
+                ) }
+                </Card>
+            }
+        }
+    };
+
+    // Watch entries get their own page: a fixed input area on top, the
+    // configured entries below.
+    let render_watch = || {
+        let state = target_form_state.clone();
+        html! {
+            <Card class="tp__config-view__card">
+                { config_field_child!(translate.t(LABEL_WATCH), dto_field_id(&target_form_state.form, "watch"), {
+                    html! {
+                        <WatchEntriesEditor
+                            entries={Rc::new(target_form_state.form.watch.clone().unwrap_or_default())}
+                            readonly={!props.allow_write}
+                            on_change={Callback::from(move |entries: Vec<ConfigWatchDto>| {
+                                state.dispatch(ConfigTargetFormAction::Watch((!entries.is_empty()).then_some(entries)));
+                            })}
+                        />
+                    }
+                })}
+            </Card>
         }
     };
 
@@ -631,6 +678,12 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
                 <Panel value={TargetFormPage::Options.intern()} active={view_visible.intern()}>
                 {render_options()}
                 </Panel>
+                <Panel value={TargetFormPage::Mapping.intern()} active={view_visible.intern()}>
+                {render_mapping()}
+                </Panel>
+                <Panel value={TargetFormPage::Watch.intern()} active={view_visible.intern()}>
+                {render_watch()}
+                </Panel>
             </div>
             </div>
         }
@@ -641,6 +694,8 @@ pub fn ConfigTargetView(props: &ConfigTargetViewProps) -> Html {
             <div class="tp__source-editor-form__sidebar">
             <IconButton class={format!("tp__app-sidebar-menu--{}{}", TargetFormPage::Main, if *view_visible == TargetFormPage::Main { " active" } else {""})}  icon="Settings" hint={translate.t(LABEL_MAIN)} name={TargetFormPage::Main.to_string()} onclick={&handle_menu_click}></IconButton>
             <IconButton class={format!("tp__app-sidebar-menu--{}{}", TargetFormPage::Options, if *view_visible == TargetFormPage::Options { " active" } else {""})}  icon="Options" hint={translate.t(LABEL_OPTIONS)} name={TargetFormPage::Options.to_string()} onclick={&handle_menu_click}></IconButton>
+            <IconButton class={format!("tp__app-sidebar-menu--{}{}", TargetFormPage::Mapping, if *view_visible == TargetFormPage::Mapping { " active" } else {""})}  icon="Mapping" hint={translate.t(LABEL_MAPPING)} name={TargetFormPage::Mapping.to_string()} onclick={&handle_menu_click}></IconButton>
+            <IconButton class={format!("tp__app-sidebar-menu--{}{}", TargetFormPage::Watch, if *view_visible == TargetFormPage::Watch { " active" } else {""})}  icon="Visibility" hint={translate.t(LABEL_WATCH)} name={TargetFormPage::Watch.to_string()} onclick={&handle_menu_click}></IconButton>
           </div>
         }
     };
@@ -750,10 +805,22 @@ mod tests {
     }
 
     #[test]
+    fn adopt_guide_epg_id_case_defaults_on_and_action_updates_nested_option() {
+        let state = default_options_state();
+        assert!(state.form.epg_output.adopt_guide_id_case);
+
+        let state = state.reduce(ConfigTargetOptionsFormAction::AdoptGuideEpgIdCase(false));
+
+        assert!(!state.form.epg_output.adopt_guide_id_case);
+        assert!(state.modified);
+        assert!(!state.form.epg_output.lowercase_ids);
+    }
+
+    #[test]
     fn clear_invalid_epg_ids_action_updates_target_option() {
         let state = default_options_state().reduce(ConfigTargetOptionsFormAction::ClearInvalidEpgIds(true));
 
-        assert!(state.form.clear_invalid_epg_ids);
+        assert!(state.form.epg_output.clear_invalid_ids);
         assert!(state.modified);
     }
 
