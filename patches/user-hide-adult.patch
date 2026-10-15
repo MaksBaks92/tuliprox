@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 4d6863d3..ca25a482 100644
+index 08ab3388..d2769de8 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -4871,6 +4871,7 @@ dependencies = [
+@@ -4872,6 +4872,7 @@ dependencies = [
   "bytes",
   "chrono",
   "crc32fast",
@@ -10,11 +10,11 @@ index 4d6863d3..ca25a482 100644
   "env_logger",
   "filetime",
   "futures",
-diff --git a/backend/app/src/api/api_utils/mod.rs b/backend/app/src/api/api_utils/mod.rs
-index e25ccfd5..a1dc613f 100644
---- a/backend/app/src/api/api_utils/mod.rs
-+++ b/backend/app/src/api/api_utils/mod.rs
-@@ -5156,6 +5156,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
+diff --git a/backend/app/src/api/api_utils/auth.rs b/backend/app/src/api/api_utils/auth.rs
+index 91baa29c..36d4ab50 100644
+--- a/backend/app/src/api/api_utils/auth.rs
++++ b/backend/app/src/api/api_utils/auth.rs
+@@ -74,6 +74,7 @@ pub fn create_api_proxy_user(app_state: &Arc<AppState>) -> ProxyUserCredentials
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: false,
@@ -22,11 +22,11 @@ index e25ccfd5..a1dc613f 100644
          comment: None,
          priority: 0,
          soft_connections: 0,
-diff --git a/backend/app/src/api/api_utils/tests.rs b/backend/app/src/api/api_utils/tests.rs
-index 1cc55164..988223dd 100644
---- a/backend/app/src/api/api_utils/tests.rs
-+++ b/backend/app/src/api/api_utils/tests.rs
-@@ -9864,6 +9864,7 @@ fn user_with_network_access(network_access: Option<NetworkAccess>) -> ProxyUserC
+diff --git a/backend/app/src/api/api_utils/tests/support.rs b/backend/app/src/api/api_utils/tests/support.rs
+index 387f4f5a..63085ca5 100644
+--- a/backend/app/src/api/api_utils/tests/support.rs
++++ b/backend/app/src/api/api_utils/tests/support.rs
+@@ -593,6 +593,7 @@ pub(in crate::api::api_utils::tests) fn user_with_network_access(
          status: None,
          output_clusters: ClusterFlags::all(),
          ui_enabled: true,
@@ -49,10 +49,10 @@ index 5a635221..4af6d296 100644
                          })
                          .count()
 diff --git a/backend/app/src/api/endpoints/hls_api/owner_token.rs b/backend/app/src/api/endpoints/hls_api/owner_token.rs
-index daee5c2f..5f8cdf1e 100644
+index ff2a825e..6723bfba 100644
 --- a/backend/app/src/api/endpoints/hls_api/owner_token.rs
 +++ b/backend/app/src/api/endpoints/hls_api/owner_token.rs
-@@ -126,7 +126,10 @@ where
+@@ -131,7 +131,10 @@ where
          HlsEntryOutputScope::ItemType(item_type) => user.allows_item_type(item_type),
          HlsEntryOutputScope::LiveCluster => user.allows_cluster(XtreamCluster::Live),
      };
@@ -65,10 +65,10 @@ index daee5c2f..5f8cdf1e 100644
  
  /// Checks that a sealed session token belongs to the requesting user, `virtual_id` and user agent.
 diff --git a/backend/app/src/api/endpoints/m3u_api.rs b/backend/app/src/api/endpoints/m3u_api.rs
-index 05fc50d6..4e4e3f6b 100644
+index a6a7f200..6826f154 100644
 --- a/backend/app/src/api/endpoints/m3u_api.rs
 +++ b/backend/app/src/api/endpoints/m3u_api.rs
-@@ -640,8 +640,8 @@ fn resolve_loaded_m3u_catchup(
+@@ -655,8 +655,8 @@ fn resolve_loaded_m3u_catchup(
      Ok((catchup_item, resolved.discriminator))
  }
  
@@ -79,7 +79,7 @@ index 05fc50d6..4e4e3f6b 100644
  }
  
  #[allow(clippy::too_many_lines)]
-@@ -881,7 +881,7 @@ async fn m3u_api_catchup(
+@@ -896,7 +896,7 @@ async fn m3u_api_catchup(
              return axum::http::StatusCode::BAD_REQUEST.into_response();
          }
      };
@@ -88,7 +88,7 @@ index 05fc50d6..4e4e3f6b 100644
          return axum::http::StatusCode::FORBIDDEN.into_response();
      }
  
-@@ -1175,10 +1175,74 @@ mod tests {
+@@ -1190,10 +1190,74 @@ mod tests {
  
      #[test]
      fn resolved_catchup_item_requires_rechecked_permissions() {
@@ -99,7 +99,7 @@ index 05fc50d6..4e4e3f6b 100644
  
 -        assert!(!resolved_m3u_item_is_allowed(&user, PlaylistItemType::Catchup));
 +        let item = shared::model::M3uPlaylistItem {
-+            virtual_id: 1,
++            virtual_id: VirtualId::new(1),
 +            provider_id: "1".intern(),
 +            input_stream_id: "1".intern(),
 +            name: "ch".intern(),
@@ -135,7 +135,7 @@ index 05fc50d6..4e4e3f6b 100644
 +        user.hide_adult = true;
 +
 +        let item = shared::model::M3uPlaylistItem {
-+            virtual_id: 1,
++            virtual_id: VirtualId::new(1),
 +            provider_id: "1".intern(),
 +            input_stream_id: "1".intern(),
 +            name: "xxx".intern(),
@@ -202,7 +202,7 @@ index 02753392..f7ce8271 100644
                  }
              }
 diff --git a/backend/app/src/api/endpoints/xmltv_api.rs b/backend/app/src/api/endpoints/xmltv_api.rs
-index a63fc644..32ea3424 100644
+index edadfdf2..82553646 100644
 --- a/backend/app/src/api/endpoints/xmltv_api.rs
 +++ b/backend/app/src/api/endpoints/xmltv_api.rs
 @@ -14,9 +14,10 @@ use crate::{
@@ -261,10 +261,10 @@ index a63fc644..32ea3424 100644
                  if !visible.contains(&channel.id.to_lowercase()) {
                      continue;
 diff --git a/backend/app/src/api/endpoints/xtream_api/mod.rs b/backend/app/src/api/endpoints/xtream_api/mod.rs
-index fc17e51e..57f3b782 100644
+index 962cd4d2..cc08bf9e 100644
 --- a/backend/app/src/api/endpoints/xtream_api/mod.rs
 +++ b/backend/app/src/api/endpoints/xtream_api/mod.rs
-@@ -326,7 +326,8 @@ async fn xtream_player_api_stream(
+@@ -327,7 +327,8 @@ async fn xtream_player_api_stream(
      } else {
          HlsEntryOutputScope::ItemType(pli.item_type)
      };
@@ -274,7 +274,7 @@ index fc17e51e..57f3b782 100644
      if !output_allowed {
          if is_hls_manifest_request {
              return hls_custom_video_manifest_response(
-@@ -1089,6 +1090,7 @@ async fn xtream_player_api_resource(
+@@ -1127,6 +1128,7 @@ async fn xtream_player_api_resource(
  
      if !user.allows_item_type(pli.item_type)
          || !(user.t_filter.is_none() || user.allows_content(&shared::model::PlaylistItem::from(&pli)))
@@ -282,7 +282,7 @@ index fc17e51e..57f3b782 100644
      {
          return axum::http::StatusCode::NOT_FOUND.into_response();
      }
-@@ -1552,6 +1554,9 @@ async fn xtream_player_api_handle_content_action(
+@@ -1589,6 +1591,9 @@ async fn xtream_player_api_handle_content_action(
                          {
                              categories.retain(|c| c.category_id.parse::<u32>().is_ok_and(|id| visible.contains(&id)));
                          }
@@ -293,7 +293,7 @@ index fc17e51e..57f3b782 100644
                      }
                      Err(err) => error!("Failed to parse json file {}: {err}", file_path.display()),
 diff --git a/backend/core/src/model/config/api_user.rs b/backend/core/src/model/config/api_user.rs
-index 8a5cd10b..14d680c5 100644
+index 864c4bcf..d228b903 100644
 --- a/backend/core/src/model/config/api_user.rs
 +++ b/backend/core/src/model/config/api_user.rs
 @@ -106,6 +106,7 @@ pub struct ProxyUserCredentials {
@@ -320,7 +320,7 @@ index 8a5cd10b..14d680c5 100644
              comment: instance.comment.clone(),
              priority: instance.priority,
              soft_connections: instance.raw_soft_connections,
-@@ -338,6 +341,48 @@ impl ProxyUserCredentials {
+@@ -344,6 +347,48 @@ impl ProxyUserCredentials {
      pub fn allows_item_type(&self, item_type: shared::model::PlaylistItemType) -> bool {
          self.output_clusters.has_cluster(item_type)
      }
@@ -369,7 +369,7 @@ index 8a5cd10b..14d680c5 100644
  }
  
  impl Drop for ProxyUserCredentials {
-@@ -457,4 +502,40 @@ mod tests {
+@@ -463,4 +508,40 @@ mod tests {
          user2.resolve_plan(&plans);
          assert_eq!(user2.proxy, ProxyType::Reverse(Some(ClusterFlags::Vod)));
      }
@@ -411,7 +411,7 @@ index 8a5cd10b..14d680c5 100644
 +    }
  }
 diff --git a/backend/repository/Cargo.toml b/backend/repository/Cargo.toml
-index 0c124685..a7763ae3 100644
+index c85ab0e1..3ff4571b 100644
 --- a/backend/repository/Cargo.toml
 +++ b/backend/repository/Cargo.toml
 @@ -24,6 +24,7 @@ blake3.workspace = true
@@ -424,7 +424,7 @@ index 0c124685..a7763ae3 100644
  futures.workspace = true
 diff --git a/backend/repository/src/adult_epg_ids.rs b/backend/repository/src/adult_epg_ids.rs
 new file mode 100644
-index 00000000..cc0cec17
+index 00000000..651bc44c
 --- /dev/null
 +++ b/backend/repository/src/adult_epg_ids.rs
 @@ -0,0 +1,368 @@
@@ -661,7 +661,7 @@ index 00000000..cc0cec17
 +        insert_adult_epg_id, playlist_item_is_adult,
 +    };
 +    use shared::model::{
-+        LiveStreamProperties, M3uPlaylistItem, PlaylistItemType, StreamProperties, XtreamCluster,
++        LiveStreamProperties, M3uPlaylistItem, PlaylistItemType, StreamProperties, VirtualId, XtreamCluster,
 +        XtreamPlaylistItem,
 +    };
 +    use shared::utils::Internable;
@@ -669,7 +669,7 @@ index 00000000..cc0cec17
 +
 +    fn blank_m3u_item() -> M3uPlaylistItem {
 +        M3uPlaylistItem {
-+            virtual_id: 0,
++            virtual_id: VirtualId::default(),
 +            provider_id: "".intern(),
 +            input_stream_id: "".intern(),
 +            name: "".intern(),
@@ -699,7 +699,7 @@ index 00000000..cc0cec17
 +
 +    fn blank_xtream_item() -> XtreamPlaylistItem {
 +        XtreamPlaylistItem {
-+            virtual_id: 0,
++            virtual_id: VirtualId::default(),
 +            provider_id: 0,
 +            name: "".intern(),
 +            logo: "".intern(),
@@ -849,7 +849,7 @@ index 99c6feae..74dcb699 100644
      }
  }
 diff --git a/backend/repository/src/lib.rs b/backend/repository/src/lib.rs
-index b9d5d667..4bdbd5c8 100644
+index 9a330be1..a37a8045 100644
 --- a/backend/repository/src/lib.rs
 +++ b/backend/repository/src/lib.rs
 @@ -1,6 +1,7 @@
@@ -1069,11 +1069,11 @@ index 4e3841f9..5133147a 100644
      }
  
      #[tokio::test]
-diff --git a/backend/session/src/active_user_manager/tests.rs b/backend/session/src/active_user_manager/tests.rs
-index d56ae619..8b4bd7e8 100644
---- a/backend/session/src/active_user_manager/tests.rs
-+++ b/backend/session/src/active_user_manager/tests.rs
-@@ -1235,6 +1235,7 @@ fn test_user_credentials(username: &str, max_connections: u32, soft_connections:
+diff --git a/backend/session/src/active_user_manager/tests/support.rs b/backend/session/src/active_user_manager/tests/support.rs
+index ac32cba0..b53eeea5 100644
+--- a/backend/session/src/active_user_manager/tests/support.rs
++++ b/backend/session/src/active_user_manager/tests/support.rs
+@@ -82,6 +82,7 @@ pub(in crate::active_user_manager::tests) fn test_user_credentials(
          status: None,
          output_clusters: shared::model::ClusterFlags::all(),
          ui_enabled: true,
@@ -1082,10 +1082,10 @@ index d56ae619..8b4bd7e8 100644
          priority: 0,
          soft_connections,
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index a1ea313a..7fcf8bd8 100644
+index 153ec6b4..34e33c1a 100644
 --- a/frontend/public/assets/i18n/ar.json
 +++ b/frontend/public/assets/i18n/ar.json
-@@ -683,6 +683,7 @@
+@@ -687,6 +687,7 @@
        "STATUS": "الحالة النشطة أو المعطلة لبيانات اعتماد وكيل المستخدم.",
        "TOKEN": "رمز API فريد يمكن استخدامه بدلاً من اسم المستخدم/كلمة المرور.",
        "UI_ENABLED": "إذا كان صحيحًا، يمكن لهذا المستخدم تسجيل الدخول إلى محرر باقة WebUI المبسط (الافتراضي صحيح).",
@@ -1093,7 +1093,7 @@ index a1ea313a..7fcf8bd8 100644
        "PRIORITY": "أولوية الاتصال المخصصة لسياق وكيل المستخدم هذا. الافتراضي = 0، أدنى أولوية = 127، أعلى أولوية = -128."
      },
      "USER_PLAN": {
-@@ -1712,6 +1713,7 @@
+@@ -1742,6 +1743,7 @@
      "USER_STATUS_TRIAL": "تجريبي",
      "USER_UI": "واجهة المستخدم",
      "USER_UI_ENABLED": "واجهة المستخدم مفعّلة",
@@ -1102,10 +1102,10 @@ index a1ea313a..7fcf8bd8 100644
      "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
      "USE_OUTPUT": "استخدام المخرج",
 diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index 3b634d35..9e13f50c 100644
+index 9210a59a..dd2f9384 100644
 --- a/frontend/public/assets/i18n/en.json
 +++ b/frontend/public/assets/i18n/en.json
-@@ -683,6 +683,7 @@
+@@ -687,6 +687,7 @@
        "STATUS": "The active or disabled state of the user proxy credential.",
        "TOKEN": "Unique API token that can be used instead of username/password.",
        "UI_ENABLED": "If true, this user can log into the simplified WebUI bouquet editor (default true).",
@@ -1113,7 +1113,7 @@ index 3b634d35..9e13f50c 100644
        "PRIORITY": "Connection priority assigned to this user proxy context. Default = 0, lowest priority = 127, highest priority = -128."
      },
      "USER_PLAN": {
-@@ -1780,6 +1781,7 @@
+@@ -1810,6 +1811,7 @@
      "USER_STATUS_TRIAL": "Trial",
      "USER_UI": "User UI",
      "USER_UI_ENABLED": "User-UI Enabled",
@@ -1122,10 +1122,10 @@ index 3b634d35..9e13f50c 100644
      "USE_MEMORY_CACHE": "Mem-Cache",
      "USE_OUTPUT": "Use output",
 diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index 9df44162..7db66c56 100644
+index bb864e3f..9e85142f 100644
 --- a/frontend/public/assets/i18n/ru.json
 +++ b/frontend/public/assets/i18n/ru.json
-@@ -683,6 +683,7 @@
+@@ -687,6 +687,7 @@
        "STATUS": "Активное или отключенное состояние учетных данных прокси пользователя.",
        "TOKEN": "Уникальный токен API, который можно использовать вместо имени пользователя/пароля.",
        "UI_ENABLED": "Если true, этот пользователь может войти в упрощенный редактор букетов WebUI (по умолчанию true).",
@@ -1133,7 +1133,7 @@ index 9df44162..7db66c56 100644
        "PRIORITY": "Приоритет соединения, назначенный этому контексту прокси пользователя. По умолчанию = 0, самый низкий приоритет = 127, самый высокий приоритет = -128."
      },
      "USER_PLAN": {
-@@ -1698,6 +1699,7 @@
+@@ -1728,6 +1729,7 @@
      "USER_STATUS_TRIAL": "Пробный",
      "USER_UI": "Пользовательский UI",
      "USER_UI_ENABLED": "User-UI включен",
