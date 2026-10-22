@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 08ab3388..d2769de8 100644
+index df72158c..db2f2c89 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -4872,6 +4872,7 @@ dependencies = [
+@@ -4874,6 +4874,7 @@ dependencies = [
   "bytes",
   "chrono",
   "crc32fast",
@@ -35,10 +35,10 @@ index 387f4f5a..63085ca5 100644
          priority: 0,
          soft_connections: 0,
 diff --git a/backend/app/src/api/endpoints/hdhomerun_api.rs b/backend/app/src/api/endpoints/hdhomerun_api.rs
-index 5a635221..4af6d296 100644
+index c729ada3..6d5ccd8a 100644
 --- a/backend/app/src/api/endpoints/hdhomerun_api.rs
 +++ b/backend/app/src/api/endpoints/hdhomerun_api.rs
-@@ -281,7 +281,8 @@ async fn lineup_status(
+@@ -319,7 +319,8 @@ async fn lineup_status(
                              let cred = Arc::clone(&cred);
                              async move {
                                  let item = res.ok()?;
@@ -849,7 +849,7 @@ index 99c6feae..74dcb699 100644
      }
  }
 diff --git a/backend/repository/src/lib.rs b/backend/repository/src/lib.rs
-index 9a330be1..a37a8045 100644
+index 42d161ea..bb43f593 100644
 --- a/backend/repository/src/lib.rs
 +++ b/backend/repository/src/lib.rs
 @@ -1,6 +1,7 @@
@@ -860,7 +860,7 @@ index 9a330be1..a37a8045 100644
  // A B+Tree-backed IPv4 lookup and a CLI dumper for the repository's databases.
  // Both read repository storage directly, so they belong here rather than in
  // `utils`, which must not depend on this layer.
-@@ -42,6 +43,7 @@ mod xtream_playlist_iterator;
+@@ -43,6 +44,7 @@ mod xtream_playlist_iterator;
  mod xtream_repository;
  
  pub use alias_repository::*;
@@ -869,33 +869,39 @@ index 9a330be1..a37a8045 100644
  pub use epg_group_index::*;
  pub use epg_repository::*;
 diff --git a/backend/repository/src/m3u_playlist_iterator.rs b/backend/repository/src/m3u_playlist_iterator.rs
-index a1fda341..5fa11de5 100644
+index 812adcf4..1baf6688 100644
 --- a/backend/repository/src/m3u_playlist_iterator.rs
 +++ b/backend/repository/src/m3u_playlist_iterator.rs
-@@ -322,6 +322,7 @@ impl M3uPlaylistIterator {
-         let proxy_type = user.proxy;
-         let output_clusters = user.output_clusters;
-         let user_filter = user.t_filter.clone();
-+        let hide_adult = user.hide_adult;
-         let target_options = target.options.clone();
-         let input_by_name: HashMap<Arc<str>, Arc<tuliprox_core::model::ConfigInput>> =
-             cfg.sources.load().inputs.iter().map(|input| (Arc::clone(&input.name), Arc::clone(input))).collect();
-@@ -362,6 +363,15 @@ impl M3uPlaylistIterator {
-                     continue;
-                 }
+@@ -290,6 +290,7 @@ async fn rewrite_player_resources_for_output(item: &mut M3uPlaylistItem, ctx: &U
+ struct M3uItemPipeline {
+     filter: Option<HashSet<String>>,
+     user_filter: Option<Arc<shared::foundation::Filter>>,
++    hide_adult: bool,
+     output_clusters: ClusterFlags,
+     base_url: String,
+     username: String,
+@@ -327,6 +328,7 @@ impl M3uItemPipeline {
+         Ok(Self {
+             filter,
+             user_filter: user.t_filter.clone(),
++            hide_adult: user.hide_adult,
+             output_clusters: user.output_clusters,
+             base_url,
+             username: user.username.clone(),
+@@ -347,6 +349,13 @@ impl M3uItemPipeline {
+             return None;
+         }
  
-+                if hide_adult
-+                    && (tuliprox_core::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
-+                        || tuliprox_core::model::ProxyUserCredentials::stream_props_marked_adult(
-+                            item.additional_properties.as_ref(),
-+                        ))
-+                {
-+                    continue;
-+                }
++        if self.hide_adult
++            && (ProxyUserCredentials::is_adult_group(item.group.as_ref())
++                || ProxyUserCredentials::stream_props_marked_adult(item.additional_properties.as_ref()))
++        {
++            return None;
++        }
 +
-                 if let Some(set) = &filter {
-                     if !set.contains(item.group.as_ref()) {
-                         continue;
+         if let Some(set) = &self.filter {
+             if !set.contains(item.group.as_ref()) {
+                 return None;
 diff --git a/backend/repository/src/startup_migration.rs b/backend/repository/src/startup_migration.rs
 index 51face15..cbc33a1b 100644
 --- a/backend/repository/src/startup_migration.rs
@@ -994,81 +1000,58 @@ index 9c8a044e..21295f05 100644
              priority: 0,
              soft_connections: 0,
 diff --git a/backend/repository/src/xtream_playlist_iterator.rs b/backend/repository/src/xtream_playlist_iterator.rs
-index 4e3841f9..5133147a 100644
+index 099fe9ef..d2fcb283 100644
 --- a/backend/repository/src/xtream_playlist_iterator.rs
 +++ b/backend/repository/src/xtream_playlist_iterator.rs
-@@ -74,6 +74,7 @@ impl XtreamPlaylistIterator {
-                     })
-                     .collect()
-             });
-+            let hide_adult = user.hide_adult;
+@@ -36,6 +36,7 @@ struct XtreamItemFilter {
+     cluster: XtreamCluster,
+     filter_ids: Option<HashSet<u32>>,
+     user_filter: Option<Arc<shared::foundation::Filter>>,
++    hide_adult: bool,
+ }
  
-             let xtream_path = xtream_path.clone();
-             let index_path = get_file_path_for_db_index(&xtream_path);
-@@ -110,7 +111,7 @@ impl XtreamPlaylistIterator {
-                         }
-                     };
+ impl XtreamItemFilter {
+@@ -59,7 +60,7 @@ impl XtreamItemFilter {
+                 })
+                 .collect()
+         });
+-        Self { cluster, filter_ids, user_filter: user.t_filter.clone() }
++        Self { cluster, filter_ids, user_filter: user.t_filter.clone(), hide_adult: user.hide_adult }
+     }
  
--                    if !Self::matches_filters(cluster, filter_ids.as_ref(), user_filter.as_ref(), &item) {
-+                    if !Self::matches_filters(cluster, filter_ids.as_ref(), hide_adult, user_filter.as_ref(), &item) {
-                         continue;
-                     }
- 
-@@ -149,6 +150,7 @@ impl XtreamPlaylistIterator {
-     fn matches_filters(
-         cluster: XtreamCluster,
-         filter_ids: Option<&HashSet<u32>>,
-+        hide_adult: bool,
-         user_filter: Option<&Arc<shared::foundation::Filter>>,
-         item: &XtreamPlaylistItem,
-     ) -> bool {
-@@ -166,6 +168,15 @@ impl XtreamPlaylistIterator {
+     #[inline]
+@@ -78,6 +79,13 @@ impl XtreamItemFilter {
              }
          }
  
-+        if hide_adult
-+            && (tuliprox_core::model::ProxyUserCredentials::is_adult_group(item.group.as_ref())
-+                || tuliprox_core::model::ProxyUserCredentials::stream_props_marked_adult(
-+                    item.additional_properties.as_ref(),
-+                ))
++        if self.hide_adult
++            && (ProxyUserCredentials::is_adult_group(item.group.as_ref())
++                || ProxyUserCredentials::stream_props_marked_adult(item.additional_properties.as_ref()))
 +        {
 +            return false;
 +        }
 +
          // per-user content filter (plan AND user), applied post-cache
-         if let Some(filter) = user_filter {
+         if let Some(filter) = &self.user_filter {
              let pli = shared::model::PlaylistItem::from(item);
-@@ -287,15 +298,28 @@ mod tests {
+@@ -350,9 +358,14 @@ mod tests {
+             shared::foundation::get_filter(r#"NOT Group ~ "^VIP.*""#, None).expect("filter parses"),
          );
  
-         // no filter: everything passes
--        assert!(XtreamPlaylistIterator::matches_filters(XtreamCluster::Live, None, None, &make_item("VIP Sports")));
-+        assert!(XtreamPlaylistIterator::matches_filters(
-+            XtreamCluster::Live,
-+            None,
-+            false,
-+            None,
-+            &make_item("VIP Sports")
-+        ));
-         // filter hides matching groups, keeps the rest
-         assert!(!XtreamPlaylistIterator::matches_filters(
-             XtreamCluster::Live,
-             None,
-+            false,
-             Some(&filter),
-             &make_item("VIP Sports")
-         ));
--        assert!(XtreamPlaylistIterator::matches_filters(XtreamCluster::Live, None, Some(&filter), &make_item("News")));
-+        assert!(XtreamPlaylistIterator::matches_filters(
-+            XtreamCluster::Live,
-+            None,
-+            false,
-+            Some(&filter),
-+            &make_item("News")
-+        ));
-     }
+-        let without_filter = XtreamItemFilter { cluster: XtreamCluster::Live, filter_ids: None, user_filter: None };
+-        let with_filter =
+-            XtreamItemFilter { cluster: XtreamCluster::Live, filter_ids: None, user_filter: Some(filter) };
++        let without_filter =
++            XtreamItemFilter { cluster: XtreamCluster::Live, filter_ids: None, user_filter: None, hide_adult: false };
++        let with_filter = XtreamItemFilter {
++            cluster: XtreamCluster::Live,
++            filter_ids: None,
++            user_filter: Some(filter),
++            hide_adult: false,
++        };
  
-     #[tokio::test]
+         // no filter: everything passes
+         assert!(without_filter.matches(&make_item("VIP Sports")));
 diff --git a/backend/session/src/active_user_manager/tests/support.rs b/backend/session/src/active_user_manager/tests/support.rs
 index ac32cba0..b53eeea5 100644
 --- a/backend/session/src/active_user_manager/tests/support.rs
@@ -1082,7 +1065,7 @@ index ac32cba0..b53eeea5 100644
          priority: 0,
          soft_connections,
 diff --git a/frontend/public/assets/i18n/ar.json b/frontend/public/assets/i18n/ar.json
-index 153ec6b4..34e33c1a 100644
+index 450c71ba..2f12ab10 100644
 --- a/frontend/public/assets/i18n/ar.json
 +++ b/frontend/public/assets/i18n/ar.json
 @@ -687,6 +687,7 @@
@@ -1102,7 +1085,7 @@ index 153ec6b4..34e33c1a 100644
      "USE_MEMORY_CACHE": "ذاكرة التخزين المؤقت",
      "USE_OUTPUT": "استخدام المخرج",
 diff --git a/frontend/public/assets/i18n/en.json b/frontend/public/assets/i18n/en.json
-index 9210a59a..dd2f9384 100644
+index 8d583c78..766d75d8 100644
 --- a/frontend/public/assets/i18n/en.json
 +++ b/frontend/public/assets/i18n/en.json
 @@ -687,6 +687,7 @@
@@ -1122,7 +1105,7 @@ index 9210a59a..dd2f9384 100644
      "USE_MEMORY_CACHE": "Mem-Cache",
      "USE_OUTPUT": "Use output",
 diff --git a/frontend/public/assets/i18n/ru.json b/frontend/public/assets/i18n/ru.json
-index bb864e3f..9e85142f 100644
+index d8faac56..931d52c8 100644
 --- a/frontend/public/assets/i18n/ru.json
 +++ b/frontend/public/assets/i18n/ru.json
 @@ -687,6 +687,7 @@

@@ -175,7 +175,7 @@ grep -q 'StoredApiUserV7' "${TREE}/backend/repository/src/startup_migration.rs"
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/repository/src/adult_epg_ids.rs"
 grep -q 'HIDE_ADULT' "${TREE}/frontend/src/app/components/userlist/proxy_user_credentials_form.rs"
 grep -q 'adult_epg_id_blocklist' "${TREE}/backend/app/src/api/endpoints/xmltv_api.rs"
-grep -q 'let hide_adult = user.hide_adult' "${TREE}/backend/repository/src/m3u_playlist_iterator.rs"
+grep -qE 'hide_adult(:|=) user\.hide_adult|let hide_adult = user\.hide_adult' "${TREE}/backend/repository/src/m3u_playlist_iterator.rs"
 
 echo "MaxPain patch applied OK (Hide Adult)"
 echo "Rebuild tuliprox and refresh playlists."
