@@ -7,11 +7,13 @@ use super::{
 mod admission;
 mod behavior;
 mod lifecycle;
+mod live_window;
 mod persistence;
 mod protocol;
 mod query;
 mod retry;
 mod startup;
+mod startup_capacity;
 mod support;
 
 use self::support::{

@@ -144,6 +144,8 @@ pub struct HlsAccessLease {
     pub startup_admission: HlsLeaseStartupAdmissionState,
     pub playback_cursor: HlsLeasePlaybackCursor,
     pub last_manifest_snapshot: Option<HlsLeaseManifestSnapshot>,
+    pub(crate) published_media_sequence_highwater: Option<u64>,
+    pub(crate) published_discontinuity_sequence_highwater: u64,
     revision_bindings: Option<Arc<HlsLeaseRevisionBindings>>,
     progressive_startup_claimed: bool,
     published_transient_resource_ids: HlsPublishedTransientResourceIds,
@@ -325,11 +327,13 @@ mod identity;
 mod lifecycle;
 mod publication;
 mod revision_bindings;
+mod revision_recovery;
 mod runtime_policy;
 mod terminal;
 mod timing;
 
 pub use self::identity::new_hls_access_lease_id;
+pub(crate) use self::revision_recovery::{HlsRevisionRecoveryGuard, HlsRevisionRecoveryOutcome};
 use self::{
     error::HlsAvailabilityEvidenceAdvanceError,
     identity::HlsMediaLeasePlaybackIdentity,

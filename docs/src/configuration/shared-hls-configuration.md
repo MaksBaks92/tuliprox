@@ -197,6 +197,21 @@ reverse_proxy:
 Use recovery burst levels gradually. Start with `friendly`. Move to stronger levels only when logs show manifest refresh
 instability and the provider can tolerate additional requests.
 
+Shared HLS evaluates a short live origin window (one or two segments) with the complete configured burst before
+allowing it. A suitable candidate with at least three segments takes priority. If only suitable short windows
+remain, the session records permission to publish them and emits one warning referencing RFC 8216 section 6.2.2.
+The `off` level evaluates its single candidate; no additional burst level is required.
+
+All access leases share the qualification and refresh work, including failure backoff. New leases, ordinary
+sequence movement, and later changes such as one → three → one segments do not consume or renew the permission.
+A request that needs a fresher manifest uses the normal shared refresh. A changed origin binding or epoch,
+acceptance conflict, or lifecycle state requiring origin revalidation starts a new shared qualification.
+
+The proxy continues to use larger available cache windows. Strip keeps already short windows intact, and
+startup admission and reserve accounting use their actual media duration. Missing segments, maps or keys,
+replayed media, empty playlists, and invalid leases remain subject to the existing checks. This exception cannot
+create media progress when the origin stops publishing.
+
 ### Problematic MPEG-TS segments
 
 ```yaml
@@ -253,6 +268,24 @@ Changing `rewrite_secret` is also disruptive for public HLS identifiers. Existin
 READY reserve, cache delivery and repair behavior. `first_ready` lowers initial admission to one processed start
 segment. Every listed successor must already have a successful HTTP 200 response and a nonempty body prefix.
 
+For untagged, rolling live playlists, each new access lease in `first_ready`, `progressive` or `optimistic`
+selects its own three-segment entry window from the newest end of the current origin playlist. This also applies
+when joining an already running shared session. `hls_cache.strip` is evaluated before selecting that window:
+segment mode counts backwards from the live edge; seconds mode sums the actual `EXTINF` durations backwards.
+The holdback is capped so at least three segments remain when the origin provides three or more. For origin
+segments `0–5`, strip `0` starts at `3,4,5`; strip `1` starts at `2,3,4`. These three segments are fetched in
+chronological order with `RenderWindow` priority. Held-back newer segments are optional reserve prefetch.
+
+After activation, strip no longer applies to that lease. Its window grows forwards up to six entries, without
+prepending segments before its previously advertised first sequence: `2,3,4` becomes `2–5`, then `2–6`, then
+`2–7`. Needed successors remain required fetch work even when reserve prefetch is disabled. Active slides retain
+contiguous cached predecessors from the lease's previous window when needed to preserve three target durations.
+A second lease independently selects its own three-segment entry. An idle re-entry also selects an entry
+window, while retaining that lease's progressive GET allowance and monotonic media sequence. A change that
+would move its sequence backwards keeps its previous valid view or returns the existing temporary error.
+The planned view is never stripped again during lease materialization. These rules do not change conservative,
+archive, ENDLIST, EVENT, VOD or other protected/transient playlist handling, or short-origin qualification.
+
 ```yaml
 reverse_proxy:
   hls_cache:
@@ -265,17 +298,30 @@ reverse_proxy:
       max_deferred_repairs: 32
 ```
 
-`progressive` lets the first full segment request consume the existing shared origin fill before origin EOF.
+`progressive` lets each access lease's first authorized full segment GET consume the existing shared origin
+fill before origin EOF, regardless of its position in the published playlist. A full request has no Range header
+or uses `Range: bytes=0-`; HEAD and partial ranges wait for complete metadata/bytes and do not consume this
+opportunity. The first full request reserves the opportunity before waiting, even if its revision is already
+complete. Concurrent or subsequent requests, including retries, wait for complete bytes. A cancelled first GET
+does not re-arm the opportunity. A new access lease has its own opportunity; playlist refreshes and seeks do not
+reset an existing lease's allowance.
 The complete session delivers immutable raw TS revisions, including subsequent requests, retries and ranges.
 Repair and the corruption watchdog continue on the processed cache copy. Raw delivery does not correct source
 timestamp or transport-stream defects; prefer `first_ready` when a source needs repair.
 
 `optimistic` behaves like `progressive` and publishes the initial playlist earlier. The head segment needs a
-body prefix, while listed successors only need an accepted HTTP 200 origin response. Successor fetches start
-together with the head, within the configured per-session concurrency. A client request for a successor waits
-for its complete body. If the origin fails a successor after it was listed, only that segment fails for the
-client; already published media never changes. Replay or disk fallback switches the session to `first_ready`
-exactly like `progressive`.
+body prefix, while listed successors only need an accepted HTTP 200 origin response. This head requirement
+controls playlist publication; it does not determine which segment the player requests first. Successor fetches start
+together with the head, within the configured per-session concurrency. The lease's first full request may select
+any published successor. It waits for a replay prefix, then streams before EOF; without replay capacity it waits
+for the complete revision instead. Other requests wait for complete bodies. If the origin fails after a revision
+has been exposed, the body errors and recovery requires a new playback entry; bytes already exposed are never
+silently replaced. A failed unexposed revision can recover through its successful retry. Existing replay and disk
+fallback rules remain in effect; successors do not change the head's session policy.
+
+A revision is considered exposed when a progressive response is prepared, before the first body chunk is sent.
+This conservative boundary applies across leases sharing that revision, even if the first client disconnects
+before reading any bytes. Listing a revision in a manifest alone does not expose it.
 
 Fast startup is limited to live, clear MPEG-TS objects without MAP or origin byte ranges. Archive, encrypted,
 fragmented-MP4 and transient sessions use their existing path. Before publication an incompatible source can fall back to that path.
@@ -290,8 +336,9 @@ or silently change the bytes of an already published URI. Revision and repair pe
 disk cache limits. Conservative behavior remains the default; existing sessions keep their startup policy after
 reload. Restart after changing to `conservative` when an immediate rollback of running sessions is required.
 
-Existing provider and fetch concurrency limits remain in effect. The initial playlist needs at least three
-publishable segments; `optimistic` counts successors the origin has accepted. With fewer than three concurrent
+Existing provider and fetch concurrency limits remain in effect. The initial playlist normally needs at least three
+publishable segments; a session qualified for short origin windows can publish one or two. `optimistic` counts
+successors the origin has accepted. With fewer than three concurrent
 fills, a cold session can still wait for an earlier origin EOF before that window is available. Raising the
 existing per-session concurrency limit to three is an operator choice and must fit the provider's connection
 allowance; startup mode never raises it automatically.

@@ -48,8 +48,10 @@ mod gc;
 pub mod header_policy;
 mod headers;
 mod ids;
+mod late_custom_response;
 mod lease;
 mod lifecycle;
+mod live_window;
 mod manager;
 mod manifest_acceptance;
 mod manifest_commit;
@@ -63,6 +65,8 @@ mod master_playlist;
 mod media_reserve;
 mod observability;
 mod origin;
+mod origin_account_runtime;
+mod origin_attempt;
 mod origin_progress;
 mod paths;
 mod post_refresh_availability;
@@ -84,6 +88,7 @@ mod segment_revision;
 mod segment_watchdog;
 mod session;
 mod session_store;
+mod short_manifest;
 mod startup_observability;
 mod startup_policy;
 mod sync_ext;
@@ -120,7 +125,7 @@ pub mod api {
             HlsTerminalResolution,
         },
         availability_reevaluation::{HlsAvailabilityReevaluationObservation, HlsAvailabilityReevaluationRegistration},
-        cache::{SegmentCacheKey, TransientObjectCacheKey},
+        cache::{CachedSegmentMetadata, SegmentCacheKey, TransientObjectCacheKey},
         deadline::hls_object_body_deadline,
         gc::exec_hls_cache_gc,
         headers::{
@@ -128,17 +133,19 @@ pub mod api {
             scrub_hls_origin_headers, should_remove_hls_origin_header,
         },
         ids::{build_proxy_session_id, HlsSessionKey, ProxySessionId, HLS_ACCESS_LEASE_ID_PLACEHOLDER},
+        late_custom_response::HlsLateCustomResponsePlan,
         lease::{
             new_hls_access_lease_id, HlsAccessLease, HlsAccessLeaseActivation, HlsAccessLeaseId,
             HlsAccessLeasePendingDeadline, HlsAccessLeaseState, HlsAccessLeaseTiming, HlsAccessLeaseTouch,
             HlsFreshManifestRequiredReason, HlsLeaseStartupAdmissionState, HlsMediaLeaseIdentity, HlsPlaybackFamilyKey,
         },
         lifecycle::{HlsLifecycleEvent, HlsLifecycleEventKey},
+        live_window::{HlsLiveWindowPlan, HlsLiveWindowView},
         manager::{exec_hls_lifecycle, HlsMediaActivityCommitOutcome, HlsProxyManager},
         manifest_commit::{
             hls_cached_manifest_options_for_requirement, hls_committed_manifest_body_for_request,
-            hls_manifest_commit_requirement, hls_should_wait_for_initial_manifest_commit, HlsCachedManifestOptions,
-            HlsCommittedManifestBody,
+            hls_live_window_origin_allowed_for_request, hls_manifest_commit_requirement,
+            hls_should_wait_for_initial_manifest_commit, HlsCachedManifestOptions, HlsCommittedManifestBody,
         },
         manifest_fetch::{LiveHlsOriginEntry, RetryPolicy},
         manifest_limits::{HlsManifestLimitViolation, MAX_HLS_MANIFEST_BYTES},
@@ -146,6 +153,7 @@ pub mod api {
             derive_hls_lease_manifest_snapshot, HlsLeaseManifestSnapshotInput, HlsTransientManifestTemplate,
         },
         map::{MapCacheStatus, MapEntry, OriginMapKey, ProxyMapId},
+        map_fetcher::MapFetchContext,
         master_playlist::{
             HlsBandwidthPersistenceOutcome, HlsMasterBandwidth, HlsMasterBandwidthSelection,
             HlsSingleVariantMasterPlaylist,
@@ -163,6 +171,9 @@ pub mod api {
             HlsOriginAccountDetachedReason, HlsOriginAccountStatus, HlsOriginIoContext, HlsOriginSource,
             HlsOriginSourceKind, HlsOriginWorkClass,
         },
+        origin_account_runtime::{
+            HlsOriginAccountRuntime, HlsOriginAccountSnapshot, HlsOriginAccountWork, HlsPreparedOriginAccount,
+        },
         origin_progress::publication_late_after_ms,
         paths::{HlsMapFile, HlsSegmentFile, TransientResourceFile},
         playback::{
@@ -174,7 +185,7 @@ pub mod api {
             cold_start_retry_after_seconds, maybe_trigger_origin_refresh_with_outcome, trigger_origin_refresh_sync,
             HlsManifestCommitRequirement, HlsOriginRefreshTriggerOutcome, HlsPostRefreshRuntime, OriginRefreshRequest,
         },
-        renderer::RenderedManifest,
+        renderer::{HlsManifestRenderer, RenderedManifest},
         resource_fetch::{
             retry_after_secs_from_ms, HlsOriginResourceClients, HlsOriginResourceFetchError, HlsResourceFetchAttempt,
         },

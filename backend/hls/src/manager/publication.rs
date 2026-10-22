@@ -34,6 +34,7 @@ impl HlsTerminalCommitPayload {
     pub(super) fn into_parts(self) -> (HlsTerminalLeaseDecision, Option<HlsTerminalCommitMediaGuard>) {
         match self {
             Self::Tail { plan, media_guard } => (HlsTerminalLeaseDecision::Tail(plan), Some(media_guard)),
+            Self::CustomResponse(plan) => (HlsTerminalLeaseDecision::CustomResponse(plan), None),
             Self::Unavailable(reason) => (HlsTerminalLeaseDecision::Unavailable(reason), None),
             Self::UnavailableAfterOwnerFailure(reason) => {
                 (HlsTerminalLeaseDecision::UnavailableAfterOwnerFailure(reason), None)
@@ -155,8 +156,11 @@ impl HlsProxyManager {
         ));
         segment_cache.install_capacity_reclaimer(&gc);
         gc.install_access_leases(&access_leases);
+        let revision_store = Arc::new(super::super::SegmentRevisionStore::default());
+        gc.install_revision_store(&revision_store);
+        segment_cache.install_revision_metrics(&metrics);
         let availability_reevaluations = Arc::new(HlsAvailabilityReevaluationCoordinator::default());
-        Self {
+        let manager = Self {
             sessions,
             segment_cache,
             segment_repair,
@@ -174,12 +178,13 @@ impl HlsProxyManager {
                 Some(Arc::clone(&availability_reevaluations)),
             )),
             progressive_budget: super::super::ProgressiveBudgetManager::new(runtime_config.startup.clone()),
-            revision_store: Arc::new(super::super::SegmentRevisionStore::default()),
+            revision_store,
             revision_reconciliation_pending: AtomicBool::new(true),
             runtime_config: ArcSwap::from_pointee(runtime_config),
             transient_resources: Arc::new(TransientResourceStore::new()),
             access_leases,
             lifecycle,
+            lease_completion: Arc::new(super::lease_completion::HlsLeaseCompletion::default()),
             account_overlap_cooldowns,
             metrics,
             qos,
@@ -191,7 +196,9 @@ impl HlsProxyManager {
             availability_reevaluations,
             terminal_commit_clock: Arc::new(HlsTerminalCommitClock::default()),
             startup_observability: Arc::new(HlsStartupObservability::default()),
-        }
+        };
+        manager.install_worker_revision_recovery();
+        manager
     }
 
     pub fn sessions(&self) -> &Arc<HlsSessionStore> { &self.sessions }
@@ -471,6 +478,18 @@ impl HlsProxyManager {
         published_transient_resource_ids: HlsPublishedTransientResourceIds,
         now_ms: u64,
     ) -> HlsLeaseManifestPublicationOutcome {
+        if snapshot.startup_revisions.is_some() {
+            return self
+                .commit_recovered_startup_manifest(
+                    lease_id,
+                    proxy_session_id,
+                    expected,
+                    snapshot,
+                    published_transient_resource_ids,
+                    now_ms,
+                )
+                .await;
+        }
         let finalized_manifest_generation = snapshot.finalized_transient_manifest_generation;
         let lease_issued_at_ms = expected.lease_issued_at_ms();
         let Some(finalized_manifest_generation) = finalized_manifest_generation else {
@@ -905,7 +924,11 @@ impl HlsProxyManager {
             }
         }
         self.schedule_session_idle_for_handle(&session).await;
-        session.write().await.configure_segment_prefetch_queue(self.segment_fetch_policy().max_prefetch_queue_depth);
+        {
+            let mut session = session.write().await;
+            session.configure_segment_prefetch_queue(self.segment_fetch_policy().max_prefetch_queue_depth);
+            session.live_window_strip = self.strip();
+        }
         (session, outcome)
     }
 }

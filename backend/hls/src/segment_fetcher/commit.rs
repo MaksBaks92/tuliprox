@@ -12,6 +12,7 @@ pub(super) struct SegmentFetchCompletion {
     pub(super) notifier: Option<Arc<Notify>>,
     pub(super) scheduled_retry: Option<ScheduledSegmentRetry>,
     pub(super) evidence_changed_for: Option<ProxySessionId>,
+    pub(super) recovery_generation: Option<u64>,
 }
 
 pub(super) struct SegmentFetchCommit {
@@ -19,11 +20,7 @@ pub(super) struct SegmentFetchCommit {
     pub(super) generation_valid: bool,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct SegmentOriginWorkFinish {
-    pub(super) generation_valid: bool,
-    pub(super) refresh_reservation: bool,
-}
+pub(super) use crate::origin_attempt::HlsMediaOriginWorkFinish as SegmentOriginWorkFinish;
 
 pub(super) fn segment_fetch_attempt_matches(entry: &SegmentEntry, snapshot: &SegmentFetchSnapshot) -> bool {
     entry.origin_key == snapshot.origin_key
@@ -117,6 +114,7 @@ impl HlsSegmentWorkerPool {
             notifier,
             scheduled_retry,
             evidence_changed_for,
+            recovery_generation: generation_valid.then_some(session.activity.origin_work_generation),
         }
     }
 
@@ -161,7 +159,8 @@ pub(super) fn commit_failed_segment_fetch(
     error: &SegmentFetchError,
     finished_at_ms: u64,
 ) {
-    let missing_candidate = session.origin_source.archive_reference.is_none()
+    let missing_candidate = !session.uses_fast_start_live_window()
+        && session.origin_source.archive_reference.is_none()
         && session
             .publishable_origin_head_proxy_seq
             .is_some_and(|head| snapshot.proxy_seq >= head && snapshot.proxy_seq <= missing_head_bound(session, head))
@@ -210,6 +209,9 @@ fn missing_head_bound(session: &super::super::HlsSession, head: u64) -> u64 {
 /// new origin window: until a client has seen that head, skipping a missing
 /// object cannot open a hole in published media.
 pub(crate) fn recompute_unpublished_live_head(session: &mut super::super::HlsSession) {
+    if session.uses_fast_start_live_window() {
+        return;
+    }
     if session.origin_source.archive_reference.is_some() {
         return;
     }
