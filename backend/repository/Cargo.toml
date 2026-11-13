@@ -24,6 +24,7 @@ blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 crc32fast.workspace = true
+dashmap.workspace = true
 env_logger.workspace = true
 filetime.workspace = true
 futures.workspace = true
