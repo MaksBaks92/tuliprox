@@ -1,6 +1,7 @@
 mod error_macros;
 mod storage;
 mod target_id_mapping;
+mod adult_epg_ids;
 #[cfg(test)]
 pub(crate) mod test_config;
 // A B+Tree-backed IPv4 lookup and a CLI dumper for the repository's databases.
@@ -49,6 +50,7 @@ mod xtream_playlist_iterator;
 mod xtream_repository;
 
 pub use alias_repository::*;
+pub use adult_epg_ids::*;
 pub use db_cli::{run_database_command, DatabaseCommand};
 pub use db_viewer::*;
 pub use epg_group_index::*;
