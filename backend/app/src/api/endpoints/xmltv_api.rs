@@ -14,9 +14,9 @@ use crate::{
         EPG_TAG_CATEGORY, EPG_TAG_CHANNEL, EPG_TAG_ICON, EPG_TAG_LIVE, EPG_TAG_NEW,
     },
     repository::{
-        epg_query_channels_by_storage_key, get_file_path_for_db_index, get_target_storage_path,
-        m3u_get_epg_file_path_for_target, open_playlist_reader, storage_const, xtream_get_epg_file_path_for_target,
-        xtream_get_storage_path, BPlusTreeQuery, XML_PREAMBLE,
+        adult_epg_id_blocklist, epg_channel_hidden_by_adult_blocklist, epg_query_channels_by_storage_key,
+        get_file_path_for_db_index, get_target_storage_path, m3u_get_epg_file_path_for_target, open_playlist_reader,
+        storage_const, xtream_get_epg_file_path_for_target, xtream_get_storage_path, BPlusTreeQuery, XML_PREAMBLE,
     },
     utils,
     utils::{
@@ -41,7 +41,7 @@ use shared::{
 };
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -383,6 +383,13 @@ async fn serve_epg_with_rewrites(
 
     let limit = limit.unwrap_or_default();
 
+    let adult_epg_ids: Option<Arc<HashSet<Arc<str>>>> = if user.hide_adult {
+        let ids = adult_epg_id_blocklist(&app_state.app_config, &app_state.playlists, target).await;
+        (!ids.is_empty()).then_some(ids)
+    } else {
+        None
+    };
+
     // EPG ids visible under the user's content filter; None = no filtering.
     let visible_epg_ids =
         crate::api::endpoints::user_visibility::collect_visible_epg_channel_ids(&app_state.app_config, target, user)
@@ -456,6 +463,11 @@ async fn serve_epg_with_rewrites(
                     return;
                 }
             };
+            if let Some(blocked) = adult_epg_ids.as_ref() {
+                if epg_channel_hidden_by_adult_blocklist(blocked, &channel.id) {
+                    continue;
+                }
+            }
             if let Some(visible) = &visible_epg_ids {
                 if !visible.contains(&channel.id.to_lowercase()) {
                     continue;
