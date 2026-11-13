@@ -417,7 +417,8 @@ async fn xtream_player_api_stream(
             } else {
                 HlsEntryOutputScope::ItemType(pli.item_type)
             };
-        let output_allowed = user_allows_entry_content(&user, output_scope, &pli);
+        let output_allowed = user_allows_entry_content(&user, output_scope, &pli)
+        && user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref());
         if !output_allowed {
             if is_last {
                 if is_hls_manifest_request {
@@ -1338,6 +1339,7 @@ async fn xtream_player_api_resource(
 
     if !user.allows_item_type(pli.item_type)
         || !(user.t_filter.is_none() || user.allows_content(&shared::model::PlaylistItem::from(&pli)))
+        || !user.allows_playlist_item(pli.group.as_ref(), pli.additional_properties.as_ref())
     {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
@@ -1811,6 +1813,9 @@ async fn xtream_player_api_handle_content_action(
                         categories.retain(|category| {
                             category.category_id.parse::<u32>().is_ok_and(|id| visible.contains(&id))
                         });
+                    }
+                    if user.hide_adult {
+                        categories.retain(|category| !ProxyUserCredentials::is_adult_group(&category.category_name));
                     }
                     return Some(axum::Json(categories).into_response());
                 }
