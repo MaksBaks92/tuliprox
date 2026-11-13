@@ -63,7 +63,7 @@ jobs:
 
       - name: Handle Version Bump
         run: |
-          chmod +x ./bin/inc_version.sh
+          if [[ -f ./bin/inc_version.sh ]]; then chmod +x ./bin/inc_version.sh; fi
           if [[ "${{ github.event_name }}" == "push" ]]; then
             case "${{ github.ref_name }}" in
               # Keep fork version identical to upstream; bump only when syncing from euzu.
@@ -77,9 +77,9 @@ jobs:
               echo "Manual ${{ github.event.inputs.branch }} builds skip version bump."
             else
               case "${{ github.event.inputs.choice }}" in
-                major) ./bin/inc_version.sh m ;;
-                minor) ./bin/inc_version.sh p ;;
-                patch) ./bin/inc_version.sh ;;
+                major) test -x ./bin/inc_version.sh && ./bin/inc_version.sh m ;;
+                minor) test -x ./bin/inc_version.sh && ./bin/inc_version.sh p ;;
+                patch) test -x ./bin/inc_version.sh && ./bin/inc_version.sh ;;
               esac
             fi
           fi
