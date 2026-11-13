@@ -766,8 +766,8 @@ fn resolve_loaded_m3u_catchup(
     Ok((catchup_item, resolved.discriminator))
 }
 
-fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, item_type: PlaylistItemType) -> bool {
-    user.allows_item_type(item_type)
+fn resolved_m3u_item_is_allowed(user: &ProxyUserCredentials, pli: &shared::model::M3uPlaylistItem) -> bool {
+    user.allows_item_type(pli.item_type) && user.allows_group(pli.group.as_ref())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1101,7 +1101,7 @@ async fn m3u_api_catchup(
                     continue;
                 }
             };
-        if !resolved_m3u_item_is_allowed(user.as_ref(), resolved_pli.item_type) {
+        if !resolved_m3u_item_is_allowed(user.as_ref(), &resolved_pli) {
             return axum::http::StatusCode::FORBIDDEN.into_response();
         }
 
@@ -1414,7 +1414,7 @@ mod tests {
         let mut user = ProxyUserCredentials::default();
         user.output_clusters = ClusterFlags::Live;
 
-        assert!(!resolved_m3u_item_is_allowed(&user, PlaylistItemType::Catchup));
+        assert!(!resolved_m3u_item_is_allowed(&user, &shared::model::M3uPlaylistItem { item_type: PlaylistItemType::Catchup, ..Default::default() }));
     }
 
     #[test]
