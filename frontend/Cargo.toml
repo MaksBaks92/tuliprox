@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 blake3.workspace = true
-shared = { workspace = true, path = "../shared" }
+shared.workspace = true
 chrono.workspace = true
 yew = "0.23.0"
 yew-router = "0.20.0"
