@@ -992,3 +992,15 @@ index c22ce695..ec1c188a 100644
 +        assert!(!user.hide_adult);
 +    }
  }
+
+diff --git a/backend/repository/src/api_user_recovery.rs b/backend/repository/src/api_user_recovery.rs
+--- a/backend/repository/src/api_user_recovery.rs
++++ b/backend/repository/src/api_user_recovery.rs
+@@ -389,6 +389,7 @@ impl From<&StoredProxyUserCredentials> for StoredApiUserV7 {
+             status: stored.status,
+             output_clusters: stored.output_clusters,
+             ui_enabled: stored.ui_enabled,
++            hide_adult: false,
+             comment: stored.comment.clone(),
+             priority: stored.priority,
+             soft_connections: stored.soft_connections,
